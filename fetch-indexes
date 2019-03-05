@@ -1,0 +1,93 @@
+#!/bin/sh
+# download current package indexes to data/<series>{,-proposed}/ for running
+# britney against a PPA. The PPA will play the role of "-proposed" (i. e.
+# "unstable" in britney terms, containing the updated packages to test), the
+# Ubuntu archive has the "-release" part (i. e. "testing" in britney terms, in
+# which the -proposed packages are being landed).
+#
+# Copyright (C) 2019 Simon Quigley <tsimonq2@ubuntu.com>
+# TODO: Ask what year should be put here
+# Copyright (C) Canonical Ltd
+# Author: Martin Pitt <martin.pitt@ubuntu.com>
+# Author: Robert Bruce Park <robert.park@canonical.com>
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -u
+
+# Download files in parallel in background, only if there is an update
+refresh() {
+    DIR=$BRITNEY_CACHE/$pocket/$(echo $1 | rev | cut --delimiter=/ --fields=2,3 | rev)
+    mkdir --parents $DIR
+    touch --no-create $BRITNEY_CACHE $BRITNEY_CACHE/$pocket "$(dirname $DIR)" $DIR  # Timestamp thwarts expire.sh
+    wget --directory-prefix $DIR --timestamping $1 --append-output $DIR/$$-wget-log --no-verbose &
+}
+
+echo 'Refreshing package indexes...'
+
+for pocket in $RELEASE $RELEASE-updates $RELEASE-proposed; do
+    for component in main restricted universe multiverse; do
+        for arch in $ARCHES; do
+            refresh $MAIN_ARCHIVE/$pocket/$component/binary-$arch/Packages.gz
+        done
+        for arch in $PORTS_ARCHES; do
+            refresh $PORTS_ARCHIVE/$pocket/$component/binary-$arch/Packages.gz
+        done
+        refresh $MAIN_ARCHIVE/$pocket/$component/source/Sources.gz
+    done
+done
+
+# Treat the source PPA as just another pocket
+for pocket in $RELEASE-ppa-proposed; do
+    for arch in $ARCHES $PORTS_ARCHES; do
+        refresh $SOURCE_PPA_URL/source/Sources.gz
+        refresh $SOURCE_PPA_URL/binary-$arch/Packages.gz
+    done
+done
+
+# Get the destination PPA
+pocket=$DEST_PPA-$RELEASE
+for arch in $ARCHES $PORTS_ARCHES; do
+    refresh $DEST_PPA_URL/binary-$arch/Packages.gz
+done
+refresh $DEST_PPA_URL/source/Sources.gz
+
+wait  # for wgets to finish
+
+find $BRITNEY_DATADIR -name "$$-wget-log*" -exec cat '{}' \; -delete 1>&2
+
+echo 'Building britney indexes...'
+
+# "Unstable" is just silo PPA
+DEST=$BRITNEY_DATADIR/$DEST_PPA-$RELEASE
+mkdir --parents $DEST "$BRITNEY_OUTDIR/$BRITNEY_TIMESTAMP/"
+touch --no-create $DEST
+loudly ln --verbose --symbolic --force --no-dereference $BRITNEY_HINTDIR $DEST/Hints
+zcat $BRITNEY_CACHE/$DEST_PPA-$RELEASE/*/source/Sources.gz > $DEST/Sources
+for arch in $ARCHES $PORTS_ARCHES; do
+    zcat $BRITNEY_CACHE/$DEST_PPA-$RELEASE/*/binary-$arch/Packages.gz > $DEST/Packages_${arch}
+done
+touch $DEST/Blocks
+touch "$DATADIR/$RELEASE/Dates"
+
+# Create config file atomically.
+#CONFIG="$DEST.conf"
+#envsubst "$CONFIG" < "$CODEDIR/britney.conf.in"
+
+#log 'Running britney...'
+#loudly $BRITNEY -v --config "$CONFIG" --series $SERIES | sed "s#$AMQP_URI#AMQP_URI#"
+
+# shellcheck disable=SC2059
+#printf "$files\n" >> $OUTDIR/$BRITNEY_TIMESTAMP/$TICKETID.manifest
+
+log "$0 done."
