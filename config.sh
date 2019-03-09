@@ -1,4 +1,4 @@
-export RELEASE="disco"
+export RELEASE="cosmic"
 
 export LP_TEAM="lubuntu-ci"
 export SOURCE_PPA="unstable-ci-proposed"
@@ -11,7 +11,7 @@ export PORTS_ARCHIVE="http://ports.ubuntu.com/dists"
 export ARCHES="i386 amd64"
 export PORTS_ARCHES="armhf arm64 ppc64el s390x"
 
-export BRITNEY_LOC="britney"
+export BRITNEY_LOC="britney2-ubuntu/britney.py"
 export BRITNEY_DATADIR="britney_data"
 export BRITNEY_OUTDIR="britney_output"
 export BRITNEY_HINTDIR="britney_hints"

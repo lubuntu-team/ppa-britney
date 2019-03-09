@@ -1,0 +1,75 @@
+# Configuration file for britney
+
+# Paths for control files
+TESTING           = britney_data/$RELEASE
+UNSTABLE          = britney_data/$SOURCE_PPA-$RELEASE
+PARTIAL_UNSTABLE  = yes
+
+# Output
+NONINST_STATUS      = britney_output/$BRITNEY_TIMESTAMP/$SOURCE_PPA-$RELEASE-non-installable-status
+EXCUSES_OUTPUT      = britney_output/$BRITNEY_TIMESTAMP/$SOURCE_PPA-$RELEASE-excuses.html
+EXCUSES_YAML_OUTPUT = britney_output/$BRITNEY_TIMESTAMP/$SOURCE_PPA-$RELEASE-excuses.yaml
+UPGRADE_OUTPUT      =
+HEIDI_OUTPUT        =
+
+# Appease piuparts
+STATE_DIR         = /tmp/piuparts-is-not-used
+
+# List of release architectures
+ARCHITECTURES     = $ARCHES $PORTS_ARCHES
+
+# if you're not in this list, arch: all packages are allowed to break on you
+NOBREAKALL_ARCHES = amd64
+
+# if you're in this list, your packages may not stay in sync with the source
+OUTOFSYNC_ARCHES  =
+
+# if you're in this list, your uninstallability count may increase
+BREAK_ARCHES      =
+
+# if you're in this list, you are a new architecture
+NEW_ARCHES        =
+
+# priorities and delays
+MINDAYS_LOW       = 0
+MINDAYS_MEDIUM    = 0
+MINDAYS_HIGH      = 0
+MINDAYS_CRITICAL  = 0
+MINDAYS_EMERGENCY = 0
+DEFAULT_URGENCY   = medium
+
+# hint permissions
+HINTS_CJWATSON    = ALL
+HINTS_ADCONRAD    = ALL
+HINTS_KITTERMAN   = ALL
+HINTS_LANEY       = ALL
+HINTS_JRIDDELL    = ALL
+HINTS_STEFANOR    = ALL
+HINTS_STGRABER    = ALL
+HINTS_VORLON      = ALL
+HINTS_PITTI       = ALL
+
+# support for old libraries in testing (smooth update)
+# use ALL to enable smooth updates for all the sections
+#
+# naming a non-existent section will effectively disable new smooth
+# updates but still allow removals to occur
+SMOOTH_UPDATES    = badgers
+
+REMOVE_OBSOLETE   = no
+
+ADT_ENABLE        = no
+ADT_DEBUG         = no
+ADT_ARCHES        = amd64 i386 armhf ppc64el s390x
+ADT_PPAS          =
+ADT_SHARED_RESULTS_CACHE = britney_data/$RELEASE/results.cache
+ADT_AMQP          =
+# Swift base URL with the results (must be publicly readable and browsable)
+ADT_SWIFT_URL     =
+
+BOOTTEST_ENABLE   = no
+BOOTTEST_DEBUG    = yes
+BOOTTEST_ARCHES   = armhf amd64
+BOOTTEST_FETCH    = yes
+
+EMAIL_ENABLE      = no

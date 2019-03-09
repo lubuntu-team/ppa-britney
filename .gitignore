@@ -1,4 +1,5 @@
 britney_data/
-britney-output/
+britney_output/
 britney_hints/
 britney_cache/
+britney.conf

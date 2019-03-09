@@ -47,20 +47,20 @@ for pocket in $RELEASE $RELEASE-updates $RELEASE-proposed; do
     done
 done
 
-# Treat the source PPA as just another pocket
+# Treat the destination PPA as just another pocket
 for pocket in $RELEASE-ppa-proposed; do
     for arch in $ARCHES $PORTS_ARCHES; do
-        refresh $SOURCE_PPA_URL/source/Sources.gz
-        refresh $SOURCE_PPA_URL/binary-$arch/Packages.gz
+        refresh $DEST_PPA_URL/source/Sources.gz
+        refresh $DEST_PPA_URL/binary-$arch/Packages.gz
     done
 done
 
-# Get the destination PPA
-pocket=$DEST_PPA-$RELEASE
+# Get the source PPA
+pocket=$SOURCE_PPA-$RELEASE
 for arch in $ARCHES $PORTS_ARCHES; do
-    refresh $DEST_PPA_URL/binary-$arch/Packages.gz
+    refresh $SOURCE_PPA_URL/binary-$arch/Packages.gz
 done
-refresh $DEST_PPA_URL/source/Sources.gz
+refresh $SOURCE_PPA_URL/source/Sources.gz
 
 wait  # for wgets to finish
 
@@ -68,26 +68,40 @@ find $BRITNEY_DATADIR -name "$$-wget-log*" -exec cat '{}' \; -delete 1>&2
 
 echo 'Building britney indexes...'
 
-# "Unstable" is just silo PPA
-DEST=$BRITNEY_DATADIR/$DEST_PPA-$RELEASE
-mkdir --parents $DEST "$BRITNEY_OUTDIR/$BRITNEY_TIMESTAMP/"
+mkdir --parents "$BRITNEY_OUTDIR/$BRITNEY_TIMESTAMP/"
+
+# "Unstable" is SOURCE_PPA
+DEST=$BRITNEY_DATADIR/$SOURCE_PPA-$RELEASE
+mkdir --parents $DEST
 touch --no-create $DEST
-loudly ln --verbose --symbolic --force --no-dereference $BRITNEY_HINTDIR $DEST/Hints
-zcat $BRITNEY_CACHE/$DEST_PPA-$RELEASE/*/source/Sources.gz > $DEST/Sources
+ln --verbose --symbolic --force --no-dereference $BRITNEY_HINTDIR $DEST/Hints
+zcat $BRITNEY_CACHE/$SOURCE_PPA-$RELEASE/*/source/Sources.gz > $DEST/Sources
 for arch in $ARCHES $PORTS_ARCHES; do
-    zcat $BRITNEY_CACHE/$DEST_PPA-$RELEASE/*/binary-$arch/Packages.gz > $DEST/Packages_${arch}
+    zcat $BRITNEY_CACHE/$SOURCE_PPA-$RELEASE/*/binary-$arch/Packages.gz > $DEST/Packages_${arch}
 done
 touch $DEST/Blocks
-touch "$DATADIR/$RELEASE/Dates"
+touch "$BRITNEY_DATADIR/$SOURCE_PPA-$RELEASE/Dates"
+
+# "Testing" is a combination of the archive and DEST_PPA
+DEST=$BRITNEY_DATADIR/$RELEASE
+mkdir --parents $DEST
+touch --no-create $DEST
+ln --verbose --symbolic --force --no-dereference $BRITNEY_HINTDIR $DEST/Hints
+zcat $BRITNEY_CACHE/$RELEASE*/*/source/Sources.gz > $DEST/Sources
+for arch in $ARCHES $PORTS_ARCHES; do
+    zcat $BRITNEY_CACHE/$RELEASE*/*/binary-$arch/Packages.gz > $DEST/Packages_${arch}
+done
+touch $DEST/Blocks
+touch "$BRITNEY_DATADIR/$SOURCE_PPA-$RELEASE/Dates"
 
 # Create config file atomically.
-#CONFIG="$DEST.conf"
-#envsubst "$CONFIG" < "$CODEDIR/britney.conf.in"
+CONFIG="britney.conf"
+envsubst < "$CONFIG.in" > "$CONFIG"
 
-#log 'Running britney...'
-#loudly $BRITNEY -v --config "$CONFIG" --series $SERIES | sed "s#$AMQP_URI#AMQP_URI#"
+echo 'Running britney...'
+$BRITNEY_LOC -v --config "$CONFIG" --series $RELEASE
 
 # shellcheck disable=SC2059
 #printf "$files\n" >> $OUTDIR/$BRITNEY_TIMESTAMP/$TICKETID.manifest
 
-log "$0 done."
+echo "$0 done."

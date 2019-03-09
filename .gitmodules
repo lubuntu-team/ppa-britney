@@ -1,0 +1,3 @@
+[submodule "britney2-ubuntu"]
+	path = britney2-ubuntu
+	url = https://git.launchpad.net/~ubuntu-release/britney/+git/britney2-ubuntu
