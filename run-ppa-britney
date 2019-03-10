@@ -1,13 +1,10 @@
 #!/bin/bash
 
 for RELEASE in $RELEASES; do
-    # This ensures the variable can be read inside all of the scripts
-    export RELEASE=$RELEASE;
-
     echo "Release: $RELEASE";
 
     # This is the main script, fetching the archives and running Britney
-    ./fetch-indexes;
+    ./fetch-indexes $RELEASE;
 
     # Britney outputs the candidates for testing migration, read the additions
     egrep -v '^(#|-)' britney_output/*/HeidiOutputDelta > candidates || echo "No candidates found.";
