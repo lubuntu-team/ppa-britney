@@ -27,6 +27,8 @@ set -u
 
 export RELEASE=$1
 
+echo $RELEASE
+
 # Download files in parallel in background, only if there is an update
 refresh() {
     DIR=$BRITNEY_CACHE/$pocket/$(echo $1 | rev | cut --delimiter=/ --fields=2,3 | rev)
@@ -35,7 +37,7 @@ refresh() {
     wget --directory-prefix $DIR --timestamping $1 --append-output $DIR/$$-wget-log --no-verbose &
 }
 
-echo 'Refreshing package indexes for $RELEASE...'
+echo 'Refreshing package indexes...'
 
 for pocket in $RELEASE $RELEASE-updates; do
     for component in main restricted universe multiverse; do
