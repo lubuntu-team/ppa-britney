@@ -23,8 +23,6 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-source config.sh
-
 set -u
 
 # Download files in parallel in background, only if there is an update
