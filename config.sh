@@ -1,5 +1,3 @@
-export RELEASE="cosmic"
-
 export LP_TEAM="lubuntu-ci"
 export SOURCE_PPA="unstable-ci-proposed"
 export SOURCE_PPA_URL="http://ppa.launchpad.net/$LP_TEAM/$SOURCE_PPA/ubuntu/dists/$RELEASE/main"
