@@ -3,8 +3,13 @@
 for RELEASE in $RELEASES; do
     echo "Release: $RELEASE";
 
+    if [ $ARCHIVE_TYPE = "ppa" ]; then
+        export SOURCE_PPA_URL="http://ppa.launchpad.net/$LP_TEAM/$SOURCE_PPA/ubuntu/dists/$RELEASE/main";
+        export DEST_PPA_URL="http://ppa.launchpad.net/$LP_TEAM/$DEST_PPA/ubuntu/dists/$RELEASE/main";
+    fi
+
     # This is the main script, fetching the archives and running Britney
-    ./fetch-indexes $RELEASE;
+    ./fetch-indexes;
 
     # Britney outputs the candidates for testing migration, read the additions
     egrep -v '^(#|-)' britney_output/*/HeidiOutputDelta > candidates || echo "No candidates found.";
