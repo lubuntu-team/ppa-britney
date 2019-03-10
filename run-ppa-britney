@@ -1,0 +1,21 @@
+#!/bin/bash
+
+for RELEASE in $RELEASES; do
+    # This ensures the variable can be read inside all of the scripts
+    export RELEASE=$RELEASE;
+
+    # This is the main script, fetching the archives and running Britney
+    ./fetch-indexes;
+
+    # Britney outputs the candidates for testing migration, read the additions
+    egrep -v '^(#|-)' britney_output/*/HeidiOutputDelta > candidates || echo "No candidates found.";
+
+    while read -r -a package; do
+        # This can eventually be extendable to different archive types
+        if [ $ARCHIVE_TYPE = "ppa" ]; then
+            ./ubuntu-archive-tools/copy-package --dry-run -y -b -s $RELEASE --from "ppa:lubuntu-ci/ubuntu/unstable-ci-proposed" --to "ppa:lubuntu-ci/ubuntu/unstable-ci" --version "${package[1]}" "${package[0]}";
+            ./ubuntu-archive-tools/remove-package --dry-run -y -s $RELEASE --archive "ppa:lubuntu-ci/ubuntu/unstable-ci-proposed" --version "${package[1]}" --removal-comment="moved to release" "${package[0]}";
+        fi
+    done < candidates;
+    rm -rf britney_output/;
+done
