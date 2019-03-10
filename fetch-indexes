@@ -35,7 +35,7 @@ refresh() {
 
 echo 'Refreshing package indexes...'
 
-for pocket in $RELEASE $RELEASE-updates $RELEASE-proposed; do
+for pocket in $RELEASE $RELEASE-updates; do
     for component in main restricted universe multiverse; do
         for arch in $ARCHES; do
             refresh $MAIN_ARCHIVE/$pocket/$component/binary-$arch/Packages.gz
