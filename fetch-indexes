@@ -33,7 +33,7 @@ refresh() {
     wget --directory-prefix $DIR --timestamping $1 --append-output $DIR/$$-wget-log --no-verbose &
 }
 
-echo 'Refreshing package indexes...'
+echo 'Refreshing package indexes for $RELEASE...'
 
 for pocket in $RELEASE $RELEASE-updates; do
     for component in main restricted universe multiverse; do

@@ -4,6 +4,8 @@ for RELEASE in $RELEASES; do
     # This ensures the variable can be read inside all of the scripts
     export RELEASE=$RELEASE;
 
+    echo "Release: $RELEASE";
+
     # This is the main script, fetching the archives and running Britney
     ./fetch-indexes;
 
