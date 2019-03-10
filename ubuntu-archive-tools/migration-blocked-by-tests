@@ -1,0 +1,31 @@
+#!/bin/sh
+
+# quick and dirty script to report, for the first transition shown in
+# update_output, the list of packages that are blocked only by autopkgtests.
+
+# this looks only at the first transition because this is normally the
+# biggest one needing immediate attention.
+
+# Author: Steve Langasek <steve.langasek@ubuntu.com>
+
+set -e
+
+cleanup() {
+	if [ -n "$WORKDIR" ]; then
+		rm -rf "$WORKDIR"
+	fi
+}
+
+WORKDIR=
+trap cleanup 0 2 3 5 10 13 15
+WORKDIR=$(mktemp -d)
+
+URLBASE=https://people.canonical.com/~ubuntu-archive/proposed-migration/
+for file in update_output.txt update_output_notest.txt; do
+	wget -q "$URLBASE/$file" -O - \
+	| sed -e'1,/easy:/d; s/^[[:space:]]\+\* [^:]*: //; q' \
+	| sed -e's/, /\n/g' > "$WORKDIR/$file"
+done
+
+LC_COLLATE=C join -v2 "$WORKDIR/update_output_notest.txt" \
+	"$WORKDIR/update_output.txt"

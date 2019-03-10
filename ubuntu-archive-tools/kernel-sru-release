@@ -1,0 +1,102 @@
+#!/usr/bin/python3
+
+# Copyright (C) 2016  Canonical Ltd.
+# Author: Steve Langasek <steve.langasek@canonical.com>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+"""Release a kernel stable release update.
+
+Copy packages from -proposed to -updates, and optionally to -security,
+following the directions of a kernel SRU workflow bug.
+
+USAGE:
+    kernel-sru-release <bug> [<bug> ...]
+"""
+
+import re
+import subprocess
+from optparse import OptionParser
+
+from launchpadlib.launchpad import Launchpad
+
+from kernel_workflow import *
+
+def release_task_callback(lp, bugnum, task, context):
+    workflow_re = re.compile(
+        r'^%skernel-sru-workflow/(?P<subtask>.*)' % str(lp._root_uri))
+    task_match = workflow_re.search(str(task.target))
+    if not task_match:
+        return {}
+    subtask = task_match.group('subtask')
+    if subtask == 'promote-to-proposed':
+        if task.status != 'Fix Released':
+            raise KernelWorkflowError(
+                      "Ignoring bug %s, promote-to-proposed not done"
+                      % bugnum)
+            return {}
+        return {'proposed': task}
+    if subtask == 'promote-to-updates':
+        if task.status != 'Confirmed':
+            raise KernelWorkflowError(
+                      "Ignoring bug %s, not ready to promote-to-updates"
+                      % bugnum)
+            return {}
+        return {'updates': task}
+    if (subtask == 'promote-to-security' and task.status == 'Confirmed'):
+        return {'security': task}
+    return {}
+
+
+def release_source_callback(lp, bugnum, tasks, full_packages, release, context):
+    if not 'proposed' in tasks or not 'updates' in tasks:
+        raise KernelWorkflowError()
+    cmd = ['sru-release', '--no-bugs', release]
+    cmd.extend(full_packages)
+    if 'security' in tasks:
+        cmd.append('--security')
+    try:
+        subprocess.check_call(cmd)
+    except subprocess.CalledProcessError:
+        print("Failed to run sru-release for %s" % bugnum)
+        raise
+
+    tasks['updates'].status = 'Fix Committed'
+    tasks['updates'].assignee = lp.me
+    tasks['updates'].lp_save()
+    if 'security' in tasks:
+        tasks['security'].status = 'Fix Committed'
+        tasks['security'].assignee = lp.me
+        tasks['security'].lp_save()
+
+
+def process_sru_bugs(lp, bugs):
+    """Process the list of bugs and call sru-release for each"""
+    for bugnum in bugs:
+        process_sru_bug(
+            lp, bugnum, release_task_callback, release_source_callback)
+
+
+if __name__ == '__main__':
+    parser = OptionParser(
+        usage="Usage: %prog bug [bug ...]")
+
+    parser.add_option("-l", "--launchpad", dest="launchpad_instance",
+                      default="production")
+
+    options, bugs = parser.parse_args()
+
+    launchpad = Launchpad.login_with(
+        'ubuntu-archive-tools', options.launchpad_instance, version='devel')
+
+    process_sru_bugs(launchpad, bugs)

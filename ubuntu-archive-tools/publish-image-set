@@ -1,0 +1,322 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+
+# Copyright (C) 2010, 2011, 2012  Canonical Ltd.
+# Author: Martin Pitt <martin.pitt@ubuntu.com>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+# Look at the ISO tracker for currently tested builds, and generate
+# publish-release commands for them.
+
+# publish-release needs to be called as follows:
+
+# for-project <derivative> publish-release <dir> <buildstamp> <type>
+#   <releaseflag> <name>
+#
+#  <derivative>: ubuntu/kubuntu/edubuntu/xubuntu
+#  <dir>: daily or daily-live, dir on cdimage.u.c./
+#  <buildstamp>: e. g. 20070605.3; ubuntu-server/daily/<timestamp> for
+#    server/netbook/etc.
+#  <type>: desktop/alternate/server/serveraddon/src
+#  <releaseflag>: yes/no/poolonly/named (should appear on releases.u.c.?)
+#  <name>: name of the release (alpha-2, beta, etc.)
+
+from __future__ import print_function
+
+from collections import defaultdict
+import optparse
+import re
+import sys
+
+# See isotracker.py for setup instructions.
+from isotracker import ISOTracker
+
+milestone_name_re = re.compile('(Alpha|Beta|RC|Final|Pre-release)(?: (\d))?')
+stable_name_re = re.compile('(Trusty|Xenial|Bionic) (14|16|18)\.04\.\d+')
+
+# do not warn about not being able to handle those
+ignore_product_re = re.compile(
+    'Netboot |Upgrade |Server EC2|Server Windows Azure|line-through')
+# this identifies known builds
+product_re = re.compile(
+    '((?:|u|lu|ku|edu|xu|myth)buntu(?: studio|kylin| kylin| gnome| mate| budgie| next)?) '
+    '(alternate|desktop|dvd|server(?: subiquity)?|mobile|base|active|wubi)(?: preinstalled)? '
+    '(i386|amd64$|amd64\+mac|armel$|armel\+dove|armel\+omap$|armel\+omap4|'
+    'armel\+ac100|armel\+mx5|armhf$|armhf\+omap$|armhf\+omap4|armhf\+ac100|'
+    'armhf\+mx5|armhf\+nexus7|armhf\+raspi2|armhf\+raspi3|arm64$|arm64\+raspi3|'
+    'powerpc|ppc64el|s390x)', re.I)
+
+# map an image type from the ISO tracker to a source directory for
+# publish-release
+type_map = {
+    'desktop': 'daily-live',
+    'alternate': 'daily',
+    'src': 'source',
+    'dvd': 'dvd',
+    'mobile': 'daily-live',
+    'active': 'daily-live',
+    'server': 'daily',
+    'base': 'daily',
+    'wubi': 'wubi',
+    'preinstalled-desktop': 'daily-preinstalled',
+    'preinstalled-mobile': 'daily-preinstalled',
+    'preinstalled-active': 'daily-preinstalled',
+    'preinstalled-server': 'ubuntu-server/daily-preinstalled',
+    'live-server': 'ubuntu-server/daily-live',
+}
+
+
+def parse_iso_tracker(opts):
+    '''Get release builds information from ISO tracker.
+
+    Return an info dictionary with the following keys:
+    - build_map: projectname -> type -> build_stamp -> set(arches)
+    - milestone_name: Milestone name (e. g. "Alpha 3")
+    - milestone_code: publish-release milestone code (e. g. "alpha-3")
+    - stable (optional): stable release name (e. g. "lucid")
+    '''
+    build_map = defaultdict(lambda: defaultdict(lambda: defaultdict(set)))
+    ret = {'build_map': build_map, 'stable': None}
+
+    # access the ISO tracker
+    isotracker = ISOTracker(target=opts.target)
+
+    # get current milestone
+    if opts.milestone:
+        ms = isotracker.get_milestone_by_name(opts.milestone)
+    else:
+        ms = isotracker.default_milestone()
+
+    if ms.status_string != 'Testing':
+        sys.stderr.write(
+            'ERROR: Current milestone is not marked as "Testing"\n')
+        sys.exit(1)
+
+    m = milestone_name_re.search(ms.title)
+    if m:
+        # require number for alphas
+        if m.group(1) != 'Alpha' or m.group(2):
+            ret['milestone_name'] = ' '.join(
+                [g for g in m.groups() if g is not None])
+            ret['milestone_code'] = (
+                ret['milestone_name'].lower().replace(' ', '-'))
+
+        if 'milestone_name' not in ret:
+            sys.stderr.write(
+                "ERROR: Milestone '%s' isn't a valid target for publishing.\n"
+                % ms.title)
+            sys.exit(1)
+
+        if ret['milestone_code'] == 'pre-release':
+            ret['milestone_code'] = 'final'
+    else:
+        m = stable_name_re.search(ms.title)
+        if not m:
+            sys.stderr.write(
+                "ERROR: Milestone '%s' isn't a valid target for publishing.\n"
+                % ms.title)
+            sys.exit(1)
+
+        ret['milestone_name'] = m.group(0)
+        ret['milestone_code'] = 'final'
+        ret['stable'] = m.group(1).lower()
+
+    # product name lookup
+    products = {}
+    for product in isotracker.tracker_products:
+        products[product.id] = product.title
+
+    # builds
+    for build in isotracker.get_builds(ms):
+        product = products[build.productid]
+
+        # Start by skipping anything in the ignore list
+        if ignore_product_re.search(product):
+            continue
+
+        if opts.prepublish or opts.include_active:
+            ready_states = ('Active', 'Ready')
+        else:
+            ready_states = ('Ready',)
+        if build.status_string not in ready_states:
+            print('Ignoring %s which has status %s' %
+                  (product, build.status_string))
+            continue
+
+        # Fail when finding an unknown product
+        m = product_re.match(product)
+        if not m:
+            sys.stderr.write('ERROR: Cannot handle product %s\n' % product)
+            sys.exit(1)
+
+        project = m.group(1).lower().replace(' ', '')
+        type = m.group(2).lower()
+        arch = m.group(3).lower()
+
+        if 'Server armhf+raspi2' in product:
+            # This product is mislabeled in the tracker:
+            type = 'preinstalled-%s' % type
+        if 'Server armhf+raspi3' in product:
+            type = 'preinstalled-%s' % type
+        if 'Server arm64+raspi3' in product:
+            type = 'preinstalled-%s' % type
+        if 'Server Subiquity' in product:
+            type = 'live-server'
+            project = 'ubuntu'
+        if 'Preinstalled' in product:
+            type = 'preinstalled-%s' % type
+        if project == 'kubuntu' and type == 'mobile':
+            project = 'kubuntu-mobile'
+        if project == 'kubuntu' and type == 'active':
+            project = 'kubuntu-active'
+            type = 'desktop'
+        if project == 'ubuntu' and type == 'base':
+            project = 'ubuntu-base'
+        if project == 'ubuntugnome':
+            project = 'ubuntu-gnome'
+        if project == 'ubuntumate':
+            project = 'ubuntu-mate'
+        if project == 'ubuntubudgie':
+            project = 'ubuntu-budgie'
+        if project == 'lubuntunext':
+            project = 'lubuntu-next'
+
+        build_map[project][type][build.version].add(arch)
+
+    return ret
+
+
+def do_publish_release(opts, project, type, buildstamp, arches, milestone,
+                       stable):
+    '''Process a particular build publishing'''
+
+    primary = set(('amd64', 'i386'))
+
+    primary_arches = arches & primary
+    ports_arches = arches - primary
+
+    if 'alpha' in milestone:
+        official = 'no'
+    else:
+        official = 'named'
+        if (project in ('ubuntu',) and
+                type in ('desktop', 'alternate', 'netbook', 'live-server',
+                         'wubi') and
+                primary_arches):
+            official = 'yes'
+    if opts.prepublish:
+        if official == 'named':
+            # no prepublication needed
+            return
+        elif official == 'yes':
+            official = 'poolonly'
+
+    # For pre-Natty: remove "official in ('yes', 'poolonly') and"
+    if official in ('yes', 'poolonly') and primary_arches and ports_arches:
+        do_publish_release(
+            opts, project, type, buildstamp, primary_arches, milestone, stable)
+        do_publish_release(
+            opts, project, type, buildstamp, ports_arches, milestone, stable)
+        return
+
+    cmd = ['for-project', project, 'publish-release']
+    if type != 'src':
+        cmd.insert(0, "ARCHES='%s'" % ' '.join(sorted(arches)))
+    if stable is not None:
+        cmd.insert(0, "DIST=%s" % stable)
+
+    if opts.dryrun:
+        cmd.append('--dry-run')
+
+    # dir and buildstamp arguments
+    try:
+        dir = type_map[type]
+        # For pre-Natty: uncomment next two lines
+        #if ports_arches:
+        #    dir = re.sub(r'daily', 'ports/daily', dir)
+        # Sometimes a daily build is treated as being one project (e.g.
+        # ubuntu-netbook) but should be published under the auspices of
+        # another project (e.g. ubuntu).  This is of course NOT AT ALL
+        # CONFUSING.
+        if project == 'ubuntu' and type == 'server':
+            dir = 'ubuntu-server/%s' % dir
+        elif project == 'ubuntu' and type == 'netbook' and primary_arches:
+            dir = 'ubuntu-netbook/%s' % dir
+        cmd.append(dir)
+        cmd.append(buildstamp)
+    except KeyError:
+        print('ERROR: Cannot handle type', type, 'for', project,
+              file=sys.stderr)
+        return
+
+    # type argument
+    cmd.append(type)
+
+    # releaseflag argument
+    cmd.append(official)
+
+    # name argument
+    if milestone != 'final':
+        cmd.append(milestone)
+
+    print(' '.join(cmd))
+
+
+def main():
+    parser = optparse.OptionParser(usage='Usage: %prog [options]')
+    parser.add_option('-m', '--milestone',
+                      help='post to MILESTONE rather than the default')
+    parser.add_option('-n', '--dry-run', dest='dryrun',
+                      action='store_true', default=False,
+                      help='Generate dry-run commands')
+    parser.add_option('-p', '--prepublish', dest='prepublish',
+                      action='store_true', default=False,
+                      help='Pre-publish images to .pool')
+    parser.add_option('-t', '--target', help='post to an alternate QATracker')
+    parser.add_option('--include-active', action='store_true', default=False,
+                      help='Always include Active (not Ready) images')
+    opts, args = parser.parse_args()
+
+    info = parse_iso_tracker(opts)
+
+    print('\n## make backup:')
+    print('cd ~/cdimage/; rm -rf www.prev; cp -al www www.prev; cd www')
+
+    print('\n## publish images:')
+    source_milestone = None
+    for project, builds in info['build_map'].items():
+        for type, buildstamps in builds.items():
+            for buildstamp, arches in buildstamps.items():
+                do_publish_release(opts, project, type, buildstamp, arches,
+                                   info['milestone_code'], info['stable'])
+                source_milestone = info['milestone_code']
+        print()
+
+    if source_milestone:
+        do_publish_release(opts, 'ubuntu', 'src', 'current', set(),
+                           source_milestone, info['stable'])
+
+    if not opts.prepublish:
+        print('\n## fix name in headers:')
+        print("find full -path '*/%s*HEADER.html' | "
+              "xargs sed -i 's/Daily Build/%s/'" %
+              (info['milestone_code'], info['milestone_name']))
+
+    print('\n## check changes against www.prev:')
+    print('diff -u <(cd ../www.prev/full && find | sort) '
+          '<(cd full && find | sort) | less')
+
+
+if __name__ == '__main__':
+    main()

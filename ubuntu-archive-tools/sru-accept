@@ -1,0 +1,77 @@
+#!/usr/bin/python
+
+# Copyright (C) 2008, 2009, 2010, 2011, 2012  Canonical Ltd.
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+"""Adjust SRU bugs after accepting the corresponding update."""
+
+from __future__ import print_function
+
+from optparse import OptionParser
+import re
+import sys
+
+import launchpadlib.errors
+from launchpadlib.launchpad import Launchpad
+from sru_workflow import process_bug
+
+
+CONSUMER_KEY = "sru-accept"
+
+
+def append_series(option, opt_str, value, parser):
+    if value.endswith('-proposed'):
+        value = value[:-9]
+    parser.values.ensure_value(option.dest, []).append(value)
+
+
+if __name__ == '__main__':
+    parser = OptionParser(
+        usage="Usage: %prog [options] -v version [options] bug [bug ...]")
+
+    parser.add_option("-l", "--launchpad", dest="launchpad_instance",
+                      default="production")
+    parser.add_option('-s', action='callback', callback=append_series,
+                      type='string', dest='targets',
+                      help='accept for SUITE(-proposed) instead of current '
+                           'stable release',
+                      metavar='SUITE')
+    parser.add_option('-p', dest='package',
+                      help='only change tasks for a particular source package',
+                      default=None,
+                      metavar='SRCPACKAGE')
+    parser.add_option('-v', dest='version',
+                      help='the version of the package being accepted',
+                      default=None,
+                      metavar='VERSION')
+
+    options, args = parser.parse_args()
+
+    if not options.version:
+        print('A package version (-v) was not provided.')
+        sys.exit(1)
+
+    launchpad = Launchpad.login_with(CONSUMER_KEY, options.launchpad_instance)
+    if not options.targets:
+        options.targets = [[
+            series.name for series in launchpad.distributions["ubuntu"].series
+            if series.status == "Current Stable Release"][0]]
+    try:
+        for num in args:
+            for series in options.targets:
+                process_bug(
+                    launchpad, options.package, options.version, series, num)
+    except launchpadlib.errors.HTTPError as err:
+        print("There was an error:")
+        print(err.content)

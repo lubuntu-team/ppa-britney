@@ -1,0 +1,722 @@
+#!/usr/bin/python
+
+# Copyright (C) 2009, 2010, 2011, 2012  Canonical Ltd.
+# Authors:
+#   Martin Pitt <martin.pitt@ubuntu.com>
+#   Jean-Baptiste Lallement <jean-baptiste.lallement@canonical.com>
+#     (initial conversion to launchpadlib)
+#   Brian Murray <brian.murray@ubuntu.com>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+# Generate a report of pending SRU
+#
+# TODO:
+# - Add to report bug reports tagged with verification-* and not in -proposed
+
+from __future__ import print_function
+
+from collections import defaultdict
+from operator import itemgetter
+
+import datetime
+import logging
+import os
+import time
+try:
+    from urllib.request import urlopen
+except ImportError:
+    from urllib import urlopen
+import yaml
+
+import apt_pkg
+from launchpadlib.errors import HTTPError
+from launchpadlib.launchpad import Launchpad as _Launchpad
+from lazr.restfulclient.errors import ClientError
+
+
+# Work around non-multiple-instance-safety of launchpadlib (bug #459418).
+class Launchpad(_Launchpad):
+    @classmethod
+    def _get_paths(cls, service_root, launchpadlib_dir=None):
+        service_root, launchpadlib_dir, cache_path, service_root_dir = (
+            _Launchpad._get_paths(
+                service_root, launchpadlib_dir=launchpadlib_dir))
+        cache_path += "-sru-report"
+        if not os.path.exists(cache_path):
+            os.makedirs(cache_path, 0o700)
+        return service_root, launchpadlib_dir, cache_path, service_root_dir
+
+
+if os.getenv('DEBUG'):
+    DEBUGLEVEL = logging.DEBUG
+else:
+    DEBUGLEVEL = logging.WARNING
+
+lp = None
+lp_url = None
+ubuntu = None
+archive = None
+releases = {}  # name -> distro_series
+series = []
+broken_bugs = set()
+ignored_commenters = []
+excuses_url = ("http://people.canonical.com/~ubuntu-archive/proposed-migration"
+               "/%s/update_excuses.yaml")
+
+
+def current_versions(distro_series, sourcename):
+    '''Get current package versions
+
+    Return map {'release': version,
+                'updates': version,
+                'proposed': version,
+                'creator': proposed_creator,
+                'signer': proposed_signer,
+                'changesfiles': [urls_of_proposed_changes],
+                'published': proposed_date}
+    '''
+    global archive
+
+    logging.debug(
+        'Fetching publishing history for %s/%s' %
+        (distro_series.name, sourcename))
+    history = {
+        'release': '', 'updates': '', 'proposed': '', 'changesfiles': [],
+        'published': datetime.datetime.now()}
+    pubs = archive.getPublishedSources(
+        source_name=sourcename, exact_match=True, status='Published',
+        distro_series=distro_series)
+    base_version = None
+    base_created = None
+    for pub in pubs:
+        p_srcpkg_version = pub.source_package_version
+        p_date_pub = pub.date_published
+        p_pocket = pub.pocket
+        if pub.pocket in ('Release', 'Updates'):
+            if (base_version is None or
+                apt_pkg.version_compare(
+                    base_version, p_srcpkg_version) < 0):
+                base_version = p_srcpkg_version
+                base_created = pub.date_created
+        elif p_pocket == 'Proposed':
+            history['changesfiles'].append(pub.changesFileUrl())
+            history['published'] = p_date_pub
+            try:
+                history['creator'] = str(pub.package_creator)
+            except ClientError as error:
+                if error.response['status'] == '410':
+                    history['creator'] = ''
+            try:
+                history['signer'] = str(pub.package_signer)
+            except ClientError as error:
+                if error.response['status'] == '410':
+                    history['signer'] = ''
+        logging.debug(
+            '%s=%s published to %s/%s on %s' %
+            (sourcename, p_srcpkg_version,
+             distro_series.name, p_pocket, p_date_pub))
+        history[p_pocket.lower()] = p_srcpkg_version
+    if base_version is not None:
+        proposed = archive.getPublishedSources(
+            source_name=sourcename, exact_match=True,
+            distro_series=distro_series, pocket='Proposed',
+            created_since_date=base_created)
+        for pub in proposed:
+            if pub.status == 'Deleted':
+                continue
+            if apt_pkg.version_compare(
+                    base_version, pub.source_package_version) >= 0:
+                continue
+            changesfileurl = pub.changesFileUrl()
+            if changesfileurl not in history['changesfiles']:
+                history['changesfiles'].append(changesfileurl)
+            if not history['published'].tzinfo:
+                history['published'] = pub.date_published
+    return history
+
+
+def bug_open_js(bugs, title=None):
+    '''Return JavaScript snippet for opening bug URLs'''
+    if not bugs:
+        return ''
+    if not title:
+        title = 'open bugs'
+
+    js = ''
+    for b in bugs:
+        js += "window.open('%s/bugs/%d');" % (lp_url, b)
+    return '<button onclick="%s">%s (%i)</button>' % (js, title, len(bugs))
+
+
+def print_report(srus):
+    '''render the report'''
+    global releases
+
+    #
+    # headers/CSS
+    #
+
+    print('''<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN"
+ "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
+<head>
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+  <title>Pending Ubuntu SRUs</title>
+  <style type="text/css">
+    body { background: #CCCCB0; color: black; }
+    a { text-decoration: none; }
+    table { border-collapse: collapse; border-style: solid none;
+            border-width: 3px; margin-bottom: 3ex; empty-cells: show; }
+    table th { text-align: left; border-style: none none dotted none;
+               border-width: 1px; padding-right: 10px; }
+    table td { text-align: left; border-style: none none dotted none;
+               border-width: 1px; padding-right: 10px; }
+    .noborder { border-style: none; }
+    a { color: blue; }
+    a.messages { color: #999900; font-weight: bold; }
+    a.incomplete { color: yellow; font-weight: bold; }
+    a.verified { color: green; font-weight: bold; }
+    a.verificationfailed { color: red; font-weight: bold; }
+    a.kerneltracking { font-style: italic; }
+    a.testing { color: blue; }
+    a.broken { text-decoration: line-through; color: black; }
+    a.removal { color: gray; font-weight: bold }
+  </style>
+</head>
+<body>
+<h1>Pending Ubuntu Stable Release Updates</h1>
+''')
+    print('<p>Generated: %s by <a href="http://bazaar.launchpad.net/'
+          '~ubuntu-archive/ubuntu-archive-tools/trunk/annotate/head%%3A/'
+          'sru-report">sru-report</a></p>' %
+          time.strftime('%F %T UTC', time.gmtime()))
+
+    print('<p>Jump to: ', end="")
+    print('<a href="#superseded">security-superseded</a> '
+          '<a href="#upload-queues">upload-queues</a> '
+          '<a href="#cleanup">cleanup</a></p>')
+
+    print('''<p>A <a href="https://wiki.ubuntu.com/StableReleaseUpdates">stable
+release update</a> is currently in progress for the following packages, i. e.
+they have a newer version in -proposed than in -updates. Note that there is a
+separate <a href="http://kernel.ubuntu.com/sru/kernel-sru-workflow.html">report
+for Kernel updates</a>. Once an update has been
+verified and released to -updates it then proceeds through the phased update
+process. The status of current updates undergoing phasing can be found in a
+separate <a
+href="http://people.canonical.com/~ubuntu-archive/phased-updates.html">
+report</a>.</p>
+
+<p>Bugs in <span style="color:green;">green</span> are verified,
+bugs in <span style="color:red;">red</span> failed verification,
+bugs in <span style="color:yellow;">yellow</span> are Incomplete,
+bugs in <span style="color: #999900;">golden</span> have received a comment
+since the package was accepted in -proposed,
+bugs in <span style="color: gray;">gray</span> are candidates for removal
+due to a lack of verification,
+bugs in <span style="font-style: italic">italic</span> are kernel tracking
+bugs and bugs that are
+<span style="text-decoration: line-through;">struck through</span> are
+duplicate bug reports or weren't accessible at the time the report was
+generated.</p>''')
+
+    #
+    # pending SRUs
+    #
+
+    pkg_index = defaultdict(dict)
+    pkgcleanup = []
+    pkgcleanup_release = []
+    pkgsuperseded = []
+    # set of (series_name, srcpkg, [bugs])
+    proposed_antique = []
+    for release in sorted(srus):
+        if not srus[release]:
+            continue
+        for pack in srus[release]:
+            pkg_index[release][pack] = srus[release][pack]['published']
+        for pkg, pub in sorted(pkg_index[release].iteritems(),
+                               key=itemgetter(1)):
+            rpkg = srus[release][pkg]
+            if cleanup(rpkg):
+                pkgcleanup.append([release, pkg, rpkg])
+                del pkg_index[release][pkg]
+                continue
+            if cleanup_release(rpkg):
+                pkgcleanup_release.append([release, pkg, rpkg])
+                del pkg_index[release][pkg]
+                continue
+            if security_superseded(rpkg):
+                pkgsuperseded.append([release, pkg, rpkg])
+                del pkg_index[release][pkg]
+                continue
+
+    for release in reversed(series):
+        if releases[release].status == "Active Development":
+            # Migrations in the development series are handled automatically.
+            continue
+        if not srus[release]:
+            continue
+        print('''<h3>%s</h3>
+<table id='%s'>
+  <tr><th>Package</th><th>-release</th><th>-updates</th>
+  <th>-proposed (signer, creator)</th>
+  <th>changelog bugs</th><th>days</th></tr>''' % (release, release))
+        for pkg, pub in sorted(pkg_index[release].iteritems(),
+                               key=itemgetter(1)):
+            # skip everything that shows up on the kernel SRU reports
+            if (pkg in ('linux', 'linux-hwe', 'linux-hwe-edge',
+                        'linux-kvm', 'linux-oem',
+                        'linux-raspi2', 'linux-snapdragon',
+                        'linux-keystone', 'linux-armadaxp', 'linux-ti-omap4',
+                        'linux-aws', 'linux-aws-hwe', 'linux-aws-edge',
+                        'linux-azure', 'linux-azure-edge',
+                        'linux-gcp', 'linux-gcp-edge',
+                        'linux-gke', 'linux-euclid', 'linux-oracle') or
+                    pkg.startswith('linux-signed') or
+                    pkg.startswith('linux-meta') or
+                    pkg.startswith('linux-lts') or
+                    pkg.startswith('linux-backports-modules')):
+                continue
+            # for langpack updates, only keep -en as a representative
+            if (pkg.startswith('language-pack-') and
+                    pkg not in ('language-pack-en', 'language-pack-en-base')):
+                continue
+            if (pkg.startswith('kde-l10n-') and pkg != 'kde-l10n-de'):
+                continue
+
+            rpkg = srus[release][pkg]
+            pkgurl = '%s/ubuntu/+source/%s/' % (lp_url, pkg)
+            age = (datetime.datetime.now() - rpkg['published'].replace(
+                tzinfo=None)).days
+
+            builds = ''
+            for arch, (state, url) in rpkg['build_problems'].items():
+                builds += '<br/>%s: <a href="%s">%s</a> ' % (arch, url, state)
+            if builds:
+                builds = '<span style="font-size: x-small">%s</span>' % builds
+
+            autopkg_fails = ''
+            for excuse in rpkg['autopkg_fails']:
+                autopkg_fails += '<br/>%s' % excuse
+            if autopkg_fails:
+                autopkg_fails = '<span style="font-size: x-small">%s</span>' \
+                    % autopkg_fails
+
+            print('  <tr><td><a href="%s">%s</a>%s %s</td> ' %
+                  (pkgurl, pkg, builds, autopkg_fails))
+            print('  <td><a href="%s">%s</a></td> ' %
+                  (pkgurl + rpkg['release'], rpkg['release']))
+            print('  <td><a href="%s">%s</a></td> ' %
+                  (pkgurl + rpkg['updates'], rpkg['updates']))
+            signer = str(rpkg['signer']).split('~')[-1]
+            uploaders = '<a href="%s/~%s">%s</a>' % \
+                (lp_url, signer, signer)
+            if rpkg['creator'] and rpkg['creator'] != rpkg['signer']:
+                creator = str(rpkg['creator']).split('~')[-1]
+                uploaders += ', <a href="%s/~%s">%s</a>' % \
+                    (lp_url, creator, creator)
+            print('  <td><a href="%s">%s</a> (%s)</td> ' %
+                  (pkgurl + rpkg['proposed'], rpkg['proposed'], uploaders))
+            print('  <td>')
+            removable = True
+            antique = False
+            for b, t in sorted(rpkg['bugs'].iteritems()):
+                cls = ' class="'
+                incomplete = False
+                try:
+                    bug = lp.bugs[b]
+                    bug_title = bug.title.encode('UTF-8')
+                    hover_text = bug_title
+                    for task in bug.bug_tasks:
+                        if task.self_link.split('/')[4] != 'ubuntu':
+                            continue
+                        if len(task.self_link.split('/')) != 10:
+                            continue
+                        if pkg == task.self_link.split('/')[7] \
+                                and release == task.self_link.split('/')[5]:
+                            if task.status == 'Incomplete':
+                                incomplete = True
+                                break
+                except KeyError:
+                    logging.debug(
+                        'bug %d does not exist or is not accessible' % b)
+                    broken_bugs.add(b)
+                    hover_text = ''
+                if ('kernel-tracking-bug' in t or
+                        'kernel-release-tracking-bug' in t):
+                    cls += 'kerneltracking '
+                if incomplete:
+                    cls += ' incomplete'
+                elif ('verification-failed' in t or
+                        'verification-failed-%s' % release in t):
+                    cls += ' verificationfailed'
+                elif 'verification-done-%s' % release in t:
+                    cls += ' verified'
+                    removable = False
+                elif b in broken_bugs:
+                    cls += ' broken'
+                    removable = False
+                elif bug:
+                    if bug.duplicate_of:
+                        cls += ' broken'
+                    last_message_date = bug.date_last_message.replace(
+                        minute=0, second=0, microsecond=0)
+                    published_date = rpkg['published'].replace(
+                        minute=0, second=0, microsecond=0)
+                    today = datetime.datetime.utcnow()
+                    if last_message_date > published_date:
+                        for message in bug.messages:
+                            m_date = message.date_created
+                            if m_date <= rpkg['published']:
+                                continue
+                            m_owner = message.owner
+                            if ('verification still needed'
+                                    in message.subject.lower()):
+                                if (m_date.replace(tzinfo=None) < today
+                                        - datetime.timedelta(16)):
+                                    cls += ' removal'
+                                    antique = True
+                                    continue
+                                if 'messages' in cls:
+                                    cls = cls.replace('messages', '')
+                                continue
+                            try:
+                                if (m_owner not in ignored_commenters and
+                                        'messages' not in cls):
+                                    cls += ' messages'
+                                if m_owner not in ignored_commenters:
+                                    hover_text = '%s\n%s\n' % ( \
+                                        bug_title, \
+                                        datetime.datetime.strftime(
+                                            m_date, '%Y-%m-%d'))
+                                    hover_text += message.content.encode(
+                                        'UTF-8') + ' - '
+                                    hover_text += m_owner.name.encode(
+                                        'UTF-8')
+                                    antique = False
+                            except ClientError as error:
+                                # people who don't use lp anymore
+                                if error.response['status'] == '410':
+                                    continue
+                cls += '"'
+
+                print('<a href="%s/bugs/%d" '
+                      'title="%s" %s>%d%s</a>' %
+                      (lp_url, b, hover_text.replace('"', ''), cls, b,
+                       '(hw)' if 'hw-specific' in t else ''))
+            if antique and removable:
+                proposed_antique.append((releases[release].name, pkg,
+                                        [str(b) for b in rpkg['bugs']]))
+            print('&nbsp;</td>')
+            print('  <td>%i</td></tr>' % age)
+        print('</table>')
+
+    #
+    # superseded by -security
+    #
+
+    print('<h2><a name="superseded">Superseded by -security</a></h2>')
+
+    print('<p>The following SRUs have been shadowed by a security update and '
+          'need to be re-merged:</p>')
+
+    for pkg in pkgsuperseded:
+        print('''<h3>%s</h3>
+<table>
+  <tr><th>Package</th><th>-proposed</th><th>-security</th></tr>''' % pkg[0])
+        pkgurl = '%s/ubuntu/+source/%s/' % (lp_url, pkg[1])
+        (vprop, vsec) = (pkg[2]['proposed'], pkg[2]['security'])
+        print('  <tr><th><a href="%s">%s</a></th> \
+        <td><a href="%s">%s</a></td> \
+        <td><a href="%s">%s</a></td></tr>' % (
+            pkgurl, pkg[1], pkgurl + vprop, vprop, pkgurl + vsec, vsec))
+        print('</table>')
+
+    print('''\
+<h2><a name="upload-queues">Upload queue status at a glance:</a></h2>
+<table class="noborder">
+<tr>
+<th class="noborder">Proposed</th>
+<th class="noborder">Updates</th>
+<th class="noborder">Backports</th>
+<th class="noborder">Security</th>
+</tr>
+  <tr>''')
+    for p in ['Proposed', 'Updates', 'Backports', 'Security']:
+        print('''    <td class="noborder"><table>
+    <tr><th>Release</th><th>Unapproved</th><th>New</th></tr>''')
+        for r in sorted(releases):
+            new_url = (
+                '%s/ubuntu/%s/+queue?queue_state=0' % (lp_url, r))
+            unapproved_url = (
+                '%s/ubuntu/%s/+queue?queue_state=1' % (lp_url, r))
+            print('      <tr><td>%s</td><td><a href="%s">%s</a></td>'
+                  '<td><a href="%s">%s</a></tr>' %
+                  (r, unapproved_url,
+                   get_queue_count('Unapproved', releases[r], p),
+                   new_url, get_queue_count('New', releases[r], p)))
+        print('    </table></td>')
+
+    print('  </tr>')
+    print('</table>')
+
+    #
+    # -proposed cleanup
+    #
+
+    print('<h2><a name="cleanup">-proposed cleanup</a></h2>')
+    print('<p>The following packages have an equal or higher version in '
+          '-updates and should be removed from -proposed:</p>')
+
+    print('<pre>')
+    for r in releases:
+        for pkg in sorted(pkgcleanup):
+            if pkg[0].startswith(r):
+                print(
+                    'remove-package -y -m "moved to -updates" -s %s-proposed '
+                    '-e %s %s' % (r, pkg[2]['proposed'], pkg[1]))
+    print('</pre>')
+
+    print('<p>The following packages have an equal or higher version in the '
+          'release pocket and should be removed from -proposed:</p>')
+
+    print('<pre>')
+    for r in releases:
+        for pkg in sorted(pkgcleanup_release):
+            if pkg[0].startswith(r):
+                print(
+                    'remove-package -y -m "moved to release" -s %s-proposed '
+                    '-e %s %s' % (r, pkg[2]['proposed'], pkg[1]))
+    print('</pre>')
+
+    print('<p>The following packages have not had their SRU bugs verified in '
+          '105 days and should be removed from -proposed:</p>')
+
+    print('<pre>')
+    for r in releases:
+        for pkg in sorted(proposed_antique):
+            if pkg[0].startswith(r):
+                print('sru-remove -s %s -p %s %s' %
+                      (r, pkg[1], ' '.join(pkg[2])))
+    print('</pre>')
+
+    print('''</body>
+    </html>''')
+
+
+def cleanup(pkgrecord):
+    '''Return True if updates is newer or equal than proposed'''
+    if 'updates' in pkgrecord:
+        return apt_pkg.version_compare(
+            pkgrecord['proposed'], pkgrecord['updates']) <= 0
+    return False
+
+
+def cleanup_release(pkgrecord):
+    '''Return True if updates is newer or equal than release'''
+    if 'release' in pkgrecord:
+        return apt_pkg.version_compare(
+            pkgrecord['proposed'], pkgrecord['release']) <= 0
+    return False
+
+
+def security_superseded(pkgrecord):
+    '''Return True if security is newer than proposed'''
+    if 'security' in pkgrecord:
+        return apt_pkg.version_compare(
+            pkgrecord['proposed'], pkgrecord['security']) < 0
+    return False
+
+
+def match_srubugs(changesfileurls):
+    '''match between bugs with verification- tag and bugs in changesfile'''
+    global lp
+    bugs = {}
+
+    for changesfileurl in changesfileurls:
+        if changesfileurl is None:
+            continue
+
+        # Load changesfile
+        logging.debug("Fetching Changelog: %s" % changesfileurl)
+        changelog = urlopen(changesfileurl)
+        bugnums = []
+        for l in changelog:
+            if l.startswith('Launchpad-Bugs-Fixed: '):
+                bugnums = [int(b) for b in l.split()[1:]]
+                break
+
+        for b in bugnums:
+            if b in bugs:
+                continue
+            try:
+                bug = lp.bugs[b]
+                bugs[b] = bug.tags
+            except KeyError:
+                logging.debug(
+                    '%s: bug %d does not exist or is not accessible' %
+                    (changesfileurl, b))
+                broken_bugs.add(b)
+                bugs[b] = []
+
+    logging.debug("%d bugs found: %s" % (len(bugs), " ".join(map(str, bugs))))
+    return bugs
+
+
+def lpinit():
+    '''Init LP credentials, archive, distro list and sru-team members'''
+    global lp, lp_url, ubuntu, archive, releases, ignored_commenters, series
+    logging.debug("Initializing LP Credentials")
+    lp = Launchpad.login_anonymously('sru-report', 'production',
+                                     version="devel")
+    lp_url = str(lp._root_uri).replace('api.', '').strip('devel/')
+    ubuntu = lp.distributions['ubuntu']
+    archive = ubuntu.getArchive(name='primary')
+    for s in ubuntu.series:
+        if s.status in ('Current Stable Release', 'Supported'):
+            releases[s.name] = s
+            series.append(s.name)
+    logging.debug('Active releases found: %s' % ' '.join(releases))
+    # create a list of people for whom comments will be ignored when
+    # displaying the last comment in the report
+    ignored_commenters = []
+    ubuntu_sru = lp.people['ubuntu-sru']
+    for participant in ubuntu_sru.participants:
+        ignored_commenters.append(participant)
+    ignored_commenters.append(lp.people['janitor'])
+    ignored_commenters.append(
+        lp.people['bug-watch-updater'])
+
+
+def get_queue_count(search_status, release, search_pocket):
+    '''Return number of results of given queue page URL'''
+    return len(release.getPackageUploads(
+        status=search_status, archive=archive, pocket=search_pocket))
+
+
+def get_srus():
+    '''Generate SRU map.
+
+    Return a dictionary release -> packagename -> {
+            'release': version,
+            'proposed': version,
+            'updates': version,
+            'published': proposed_date,
+            'bugs': [buglist],
+            'changesfiles': [changes_urls],
+            'build_problems': { arch -> (state, URL) },
+            'autopkg_fails': [excuses]
+            }
+    '''
+    srus = defaultdict(dict)
+
+    for release in releases:
+        #if releases[release].status not in (
+        #    "Active Development", "Pre-release Freeze"):
+        #    continue # for quick testing
+        pkg_excuses = []
+        if release != 'lucid':
+            excuses_page = excuses_url % release
+            excuses = urlopen(excuses_page)
+            excuses_data = yaml.load(excuses)
+            pkg_excuses = [excuse['source']
+                           for excuse in excuses_data['sources']
+                           if 'autopkgtest' in excuse['reason']
+                           or 'block' in excuse['reason']]
+
+        for published in archive.getPublishedSources(
+                pocket='Proposed', status='Published',
+                distro_series=releases[release]):
+            pkg = published.source_package_name
+
+            srus[release][pkg] = current_versions(releases[release], pkg)
+            srus[release][pkg]['bugs'] = match_srubugs(
+                srus[release][pkg]['changesfiles'])
+
+            srus[release][pkg]['build_problems'] = {}
+            try:
+                for build in published.getBuilds():
+                    if not build.buildstate.startswith('Success'):
+                        srus[release][pkg]['build_problems'][build.arch_tag] \
+                            = (build.buildstate, build.web_link)
+            except HTTPError as e:
+                if e.response['status'] == '401':
+                    continue
+                else:
+                    raise e
+
+            srus[release][pkg]['autopkg_fails'] = []
+            if pkg in pkg_excuses:
+                for excuse in excuses_data['sources']:
+                    if excuse['source'] == pkg:
+                        if 'autopkgtest' not in excuse['policy_info']:
+                            continue
+                        for testpkg in excuse['policy_info']['autopkgtest']:
+                            for arch in excuse['policy_info']['autopkgtest'][testpkg]:
+                                if excuse['policy_info']['autopkgtest'][testpkg][arch][0] == 'REGRESSION':
+                                    link = excuse['policy_info']['autopkgtest'][testpkg][arch][1]
+                                    testpkg_name = testpkg.split('/')[0]
+                                    if testpkg_name.startswith('lib'):
+                                        testpkg_idx = testpkg_name[:3]
+                                    else:
+                                        testpkg_idx = testpkg_name[0]
+                                    autopkg_url = 'http://autopkgtest.ubuntu.com/packages/%s/%s/%s/%s' % (testpkg_idx, testpkg_name, release, arch)
+                                    srus[release][pkg]['autopkg_fails'].append('Regression in autopkgtest for <a href="%s">%s (%s)</a>: <a href="%s">test log</a>' % (autopkg_url, testpkg_name, arch, link))
+
+    return srus
+
+
+def bugs_from_changes(change_url):
+    '''Return (bug_list, cve_list) from a .changes file URL'''
+    changelog = urlopen(change_url)
+
+    refs = []
+    bugs = set()
+    cves = set()
+
+    for l in changelog:
+        if l.startswith('Launchpad-Bugs-Fixed: '):
+            refs = [int(b) for b in l.split()[1:]]
+            break
+
+    for b in refs:
+        try:
+            lpbug = lp.bugs[b]
+        except KeyError:
+            logging.debug('%s: bug %d does not exist or is not accessible' % (
+                change_url, b))
+            broken_bugs.add(b)
+            continue
+        if lpbug.title.startswith('CVE-'):
+            cves.add(b)
+        else:
+            bugs.add(b)
+
+    return (sorted(bugs), sorted(cves))
+
+
+def main():
+    logging.basicConfig(level=DEBUGLEVEL,
+                        format="%(asctime)s - %(levelname)s - %(message)s")
+    lpinit()
+    apt_pkg.init_system()
+
+    srus = get_srus()
+
+    print_report(srus)
+
+
+if __name__ == "__main__":
+    main()

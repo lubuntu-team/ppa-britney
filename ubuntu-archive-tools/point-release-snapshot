@@ -1,0 +1,37 @@
+#! /usr/bin/env python
+
+from __future__ import print_function
+
+from optparse import OptionParser
+import os
+import subprocess
+
+
+def main():
+    parser = OptionParser(usage="%prog [options] distroseries snapshot-name")
+    parser.add_option(
+        "-n", "--dry-run", default=False, action="store_true",
+        help="only show actions that would be performed")
+    options, args = parser.parse_args()
+    if len(args) < 2:
+        parser.error("need distroseries and snapshot-name")
+
+    dist = args[0]
+    snapshot = args[1]
+
+    base = os.path.expanduser('~/mirror/ubuntu')
+    snapshot_base = os.path.expanduser('~/point-releases/%s' % snapshot)
+
+    dst = os.path.join(snapshot_base, 'dists')
+    os.makedirs(dst)
+    for pocket in ('%s-security' % dist, '%s-updates' % dist):
+        disttree = os.path.join(base, 'dists', pocket)
+        src = os.path.join(base, disttree)
+        if options.dry_run:
+            print('cp -a %s %s' % (src, dst))
+        else:
+            subprocess.call(['cp', '-a', src, dst])
+
+
+if __name__ == '__main__':
+    main()

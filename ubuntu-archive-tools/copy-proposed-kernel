@@ -1,0 +1,116 @@
+#!/usr/bin/python
+
+# Copyright (C) 2011, 2012  Canonical Ltd.
+# Author: Martin Pitt <martin.pitt@canonical.com>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+'''Copy a kernel from the kernel team's PPA to -proposed.
+
+USAGE:
+   copy-proposed-kernel [--security] <release> <sourcepackage>
+'''
+
+from __future__ import print_function
+
+import argparse
+import sys
+
+from launchpadlib.launchpad import Launchpad
+
+
+parser = argparse.ArgumentParser(description='Copy a proposed kernel to the apropriate archive pocket')
+parser.add_argument('--dry-run', action='store_true', help='Do everything but actually copy the package')
+parser.add_argument('--security', '-S', action='store_true', help='Copy from the kernel security PPA')
+parser.add_argument('--security2', action='store_true', help='Copy from the kernel security PPA2')
+parser.add_argument('--esm', '-E', action='store_true', help='Copy from the kernel ESM PPA and to the kernel ESM proposed PPA')
+parser.add_argument('--no-auto', action='store_true', help='Turn off automatic detection of ESM et al based on series')
+parser.add_argument('series', action='store', help='The series the source package is in')
+parser.add_argument('source', action='store', help='The source package name')
+
+args = parser.parse_args()
+
+to = 'ubuntu'
+ppa_name = '~canonical-kernel-team/ubuntu/ppa'
+security = False
+
+# If we are allowed to intuit destinations do so:
+# 1) precise is now destined for the ESM PPAs
+if not args.no_auto:
+    if args.series == 'precise' and not args.esm:
+        print("NOTE: directing copy from and to ESM for precise")
+        args.esm = True
+
+if args.esm:
+    ppa_name = '~canonical-kernel-esm/ubuntu/ppa'
+    to = '~canonical-kernel-esm/ubuntu/proposed'
+    to_pocket = 'release'
+if args.security:
+    ppa_name = '~canonical-kernel-security-team/ubuntu/ppa'
+    if not args.esm:
+        security = True
+    else:
+        ppa_name = '~canonical-kernel-security-team/ubuntu/esm'
+if args.security2:
+    ppa_name = '~canonical-kernel-security-team/ubuntu/ppa2'
+    if not args.esm:
+        security = True
+
+(release, pkg) = (args.series, args.source)
+
+launchpad = Launchpad.login_with(
+    'ubuntu-archive-tools', 'production', version='devel')
+ubuntu = launchpad.distributions['ubuntu']
+distro_series = ubuntu.getSeries(name_or_version=release)
+kernel_ppa = launchpad.archives.getByReference(
+    reference=ppa_name)
+
+# get current version in PPA for that series
+versions = kernel_ppa.getPublishedSources(
+    source_name=pkg, exact_match=True, status='Published', pocket='Release',
+    distro_series=distro_series)
+assert versions.total_size == 1
+version = versions[0].source_package_version
+
+include_binaries = (pkg not in ('debian-installer')
+                    and not pkg.startswith('linux-signed'))
+
+# Grab a reference to the 'to' archive and select a pocket.
+to_archive = launchpad.archives.getByReference(reference=to)
+if to == 'ubuntu':
+    to_pocket = 'proposed'
+else:
+    to_pocket = 'release'
+
+print("""Copying {}/{}:
+ From: {} release
+ To: {} {}""".format(pkg, version, kernel_ppa, to_archive, to_pocket))
+
+if args.dry_run:
+    print("Dry run; no packages copied.")
+    sys.exit(0)
+
+# Finally ready to actually copy this.
+to_archive.copyPackage(
+    from_archive=kernel_ppa, include_binaries=include_binaries,
+    source_name=pkg, to_series=release, to_pocket=to_pocket, version=version,
+    auto_approve=True, unembargo=security)
+
+# TODO: adjust this script to use find-bin-overrides or rewrite
+# find-bin-overrides to use lpapi and use it here.
+print('''
+IMPORTANT: Please verify the overrides are correct for this source package.
+Failure to do so may result in uninstallability when it is ultimately copied to
+-updates/-security. lp:ubuntu-qa-tools/security-tools/find-bin-overrides can
+help with this.
+''')

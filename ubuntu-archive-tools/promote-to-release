@@ -1,0 +1,196 @@
+#! /usr/bin/python
+
+# Copyright (C) 2012  Canonical Ltd.
+# Author: Colin Watson <cjwatson@ubuntu.com>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+"""Promote packages to release pocket based on britney output."""
+
+from __future__ import print_function
+
+from optparse import OptionParser
+import sys
+
+from launchpadlib.errors import HTTPError
+from launchpadlib.launchpad import Launchpad
+
+import lputils
+
+
+def promote(options, name, version, architecture):
+    if architecture is None:
+        display = "%s/%s" % (name, version)
+    else:
+        display = "%s/%s/%s" % (name, version, architecture)
+
+    if architecture is None:
+        try:
+            release_sources = options.archive.getPublishedSources(
+                source_name=name, version=version,
+                distro_series=options.series, pocket="Release",
+                exact_match=True, status="Published")
+        except IndexError:
+            release_sources = options.archive.getPublishedSources(
+                source_name=name, version=version,
+                distro_series=options.series, pocket="Release",
+                exact_match=True, status="Pending")
+        except HTTPError as e:
+            print("getPublishedSources %s: %s" % (display, e.content),
+                  file=sys.stderr)
+            return True
+        if len(release_sources) > 0:
+            return True
+
+    if options.dry_run:
+        print("Would copy: %s" % display)
+        return
+    elif options.verbose:
+        print("Copying: %s" % display)
+        sys.stdout.flush()
+
+    try:
+        options.archive.copyPackage(
+            source_name=name, version=version,
+            from_archive=options.archive,
+            from_series=options.series.name, from_pocket="Proposed",
+            to_series=options.series.name, to_pocket="Release",
+            include_binaries=True, sponsored=options.requestor,
+            auto_approve=True)
+    except HTTPError as e:
+        print("copyPackage %s: %s" % (display, e.content), file=sys.stderr)
+        return False
+
+    try:
+        proposed_source = options.archive.getPublishedSources(
+            source_name=name, version=version,
+            distro_series=options.series, pocket="Proposed",
+            exact_match=True)[0]
+    except HTTPError as e:
+        print("getPublishedSources %s: %s" % (display, e.content),
+              file=sys.stderr)
+        return True
+    except IndexError:
+        print("getPublishedSources %s found no publication" % display,
+              file=sys.stderr)
+        return True
+
+    if architecture is None:
+        try:
+            proposed_source.requestDeletion(removal_comment="moved to release")
+        except HTTPError as e:
+            print("requestDeletion %s: %s" % (display, e.content),
+                  file=sys.stderr)
+    else:
+        for bpph in proposed_source.getPublishedBinaries():
+            if bpph.is_debug:
+                continue
+            elif bpph.architecture_specific:
+                if architecture != bpph.distro_arch_series.architecture_tag:
+                    continue
+            else:
+                if architecture != "i386":
+                    continue
+            try:
+                bpph.requestDeletion(removal_comment="moved to release")
+            except HTTPError as e:
+                print("requestDeletion %s/%s/%s: %s" %
+                      (bpph.binary_package_name, bpph.binary_package_version,
+                       bpph.distro_arch_series.architecture_tag, e.content),
+                      file=sys.stderr)
+
+    return True
+
+
+def promote_all(options, delta):
+    with open(delta) as delta_file:
+        for line in delta_file:
+            if line.startswith("#"):
+                continue
+            words = line.rstrip("\n").split(" ")
+            if len(words) == 1:
+                name = words[0]
+                print("Cannot handle removal: %s" % name, file=sys.stderr)
+                continue
+            elif len(words) == 2:
+                name = words[0]
+                if name.startswith("-"):
+                    print("Cannot handle removal: %s" % name[1:],
+                          file=sys.stderr)
+                    continue
+                elif "/" in name:
+                    name, architecture = name.split("/", 1)
+                else:
+                    architecture = None
+                version = words[1]
+                if not promote(options, name, version, architecture):
+                    # Stop on any single failure.  Britney's output delta
+                    # should be ordered such that the optimal order of
+                    # copying is from start to finish, and skipping one is
+                    # more likely to cause problems than aborting.
+                    return False
+            elif len(words) == 3:
+                name = words[0]
+                if name.startswith("-"):
+                    print("Cannot handle removal: %s" % name[1:],
+                          file=sys.stderr)
+                    continue
+                version = words[1]
+                architecture = words[2]
+                if not promote(options, name, version, architecture):
+                    # Stop on any single failure.  Britney's output delta
+                    # should be ordered such that the optimal order of
+                    # copying is from start to finish, and skipping one is
+                    # more likely to cause problems than aborting.
+                    return False
+    return True
+
+
+def main():
+    parser = OptionParser(usage="usage: %prog [options] BRITNEY-OUTPUT-DELTA")
+    parser.add_option(
+        "-l", "--launchpad", dest="launchpad_instance", default="production")
+    parser.add_option(
+        "-n", "--dry-run", default=False, action="store_true",
+        help="only show copies that would be performed")
+    parser.add_option(
+        "-v", "--verbose", default=False, action="store_true",
+        help="be more verbose (redundant in --dry-run mode)")
+    parser.add_option(
+        "-d", "--distribution", default="ubuntu",
+        metavar="DISTRIBUTION", help="promote within DISTRIBUTION")
+    # dest="suite" to make lputils.setup_location's job easier.
+    parser.add_option(
+        "-s", "--series", dest="suite",
+        metavar="SERIES", help="promote from SERIES-proposed to SERIES")
+    options, args = parser.parse_args()
+    if len(args) != 1:
+        parser.error("need britney output delta file")
+
+    options.launchpad = Launchpad.login_with(
+        "promote-to-release", options.launchpad_instance, version="devel")
+    lputils.setup_location(options)
+    options.dases = {}
+    for das in options.series.architectures:
+        options.dases[das.architecture_tag] = das
+
+    options.requestor = options.launchpad.people["katie"]
+
+    if promote_all(options, args[0]):
+        return 0
+    else:
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

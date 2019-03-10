@@ -1,0 +1,204 @@
+#! /usr/bin/python
+
+# Copyright 2012 Canonical Ltd.
+# Author: Colin Watson <cjwatson@ubuntu.com>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+"""Override a publication."""
+
+from __future__ import print_function
+
+from collections import OrderedDict
+from optparse import OptionParser, SUPPRESS_HELP
+
+from launchpadlib.launchpad import Launchpad
+from ubuntutools.question import YesNoQuestion
+
+import lputils
+
+
+def find_publications(options, packages):
+    for package in packages:
+        # Change matching source.
+        if (options.source_and_binary or options.binary_and_source or
+                options.source_only):
+            source = lputils.find_latest_published_source(options, package)
+            yield "source", source
+
+        # Change all binaries for matching source.
+        if options.source_and_binary:
+            for binary in source.getPublishedBinaries():
+                if not binary.is_debug:
+                    yield "binary", binary
+        # Change matching binaries.
+        elif not options.source_only:
+            for binary in lputils.find_latest_published_binaries(
+                    options, package):
+                if not binary.is_debug:
+                    yield "binary", binary
+
+
+def stringify_phased_update_percentage(phased_update_percentage):
+    if phased_update_percentage is None:
+        return "100%"
+    else:
+        return '%s%%' % phased_update_percentage
+
+
+def stringify_binary_kwargs(binary_kwargs):
+    for key, value in binary_kwargs.items():
+        if key == "new_phased_update_percentage":
+            yield stringify_phased_update_percentage(value)
+        else:
+            yield value
+
+
+def change_overrides(options, packages):
+    source_kwargs = OrderedDict()
+    binary_kwargs = OrderedDict()
+    if options.component:
+        print("Override component to %s" % options.component)
+        source_kwargs["new_component"] = options.component
+        binary_kwargs["new_component"] = options.component
+    if options.section:
+        print("Override section to %s" % options.section)
+        source_kwargs["new_section"] = options.section
+        binary_kwargs["new_section"] = options.section
+    if options.priority:
+        print("Override priority to %s" % options.priority)
+        binary_kwargs["new_priority"] = options.priority
+    if options.percentage is not None:
+        print("Override percentage to %s" % options.percentage)
+        binary_kwargs["new_phased_update_percentage"] = options.percentage
+
+    publications = []
+    for pubtype, publication in find_publications(options, packages):
+        if pubtype == "source" and not source_kwargs:
+            continue
+
+        publications.append((pubtype, publication))
+
+        if pubtype == "source":
+            print("%s: %s/%s -> %s" % (
+                publication.display_name,
+                publication.component_name, publication.section_name,
+                "/".join(source_kwargs.values())))
+        else:
+            print("%s: %s/%s/%s/%s -> %s" % (
+                publication.display_name,
+                publication.component_name, publication.section_name,
+                publication.priority_name.lower(),
+                stringify_phased_update_percentage(
+                    publication.phased_update_percentage),
+                "/".join(stringify_binary_kwargs(binary_kwargs))))
+
+    if options.dry_run:
+        print("Dry run; no publications overridden.")
+    else:
+        if not options.confirm_all:
+            if YesNoQuestion().ask("Override", "no") == "no":
+                return
+
+        num_overridden = 0
+        num_same = 0
+        for pubtype, publication in publications:
+            if pubtype == "source":
+                kwargs = source_kwargs
+            else:
+                kwargs = binary_kwargs
+            if publication.changeOverride(**kwargs):
+                num_overridden += 1
+            else:
+                print("%s remained the same" % publication.display_name)
+                num_same += 1
+
+        summary = []
+        if num_overridden:
+            summary.append("%d %s overridden" % (
+                num_overridden,
+                "publication" if num_overridden == 1 else "publications"))
+        if num_same:
+            summary.append("%d %s remained the same" % (
+                num_same, "publication" if num_same == 1 else "publications"))
+        if summary:
+            print("%s." % "; ".join(summary))
+
+
+def main():
+    parser = OptionParser(
+        usage="usage: %prog -s suite [options] package [...]",
+        epilog=lputils.ARCHIVE_REFERENCE_DESCRIPTION)
+    parser.add_option(
+        "-l", "--launchpad", dest="launchpad_instance", default="production")
+    parser.add_option(
+        "-n", "--dry-run", default=False, action="store_true",
+        help="only show removals that would be performed")
+    parser.add_option(
+        "-y", "--confirm-all", default=False, action="store_true",
+        help="do not ask for confirmation")
+    parser.add_option("-A", "--archive", help="override in ARCHIVE")
+    parser.add_option(
+        "-s", "--suite", metavar="SUITE", help="override in SUITE")
+    parser.add_option(
+        "-a", "--architecture", dest="architectures", action="append",
+        metavar="ARCHITECTURE",
+        help="architecture tag (may be given multiple times)")
+    parser.add_option(
+        "-e", "--version",
+        metavar="VERSION", help="package version (default: current version)")
+    parser.add_option(
+        "-S", "--source-and-binary", default=False, action="store_true",
+        help="select source and all binaries from this source")
+    parser.add_option(
+        "-B", "--binary-and-source", default=False, action="store_true",
+        help="select source and binary (of the same name)")
+    parser.add_option(
+        "-t", "--source-only", default=False, action="store_true",
+        help="select source packages only")
+    parser.add_option(
+        "-c", "--component",
+        metavar="COMPONENT", help="move package to COMPONENT")
+    parser.add_option(
+        "-p", "--priority",
+        metavar="PRIORITY", help="move package to PRIORITY")
+    parser.add_option(
+        "-x", "--section",
+        metavar="SECTION", help="move package to SECTION")
+    parser.add_option(
+        "-z", "--percentage", type="int", default=None,
+        metavar="PERCENTAGE", help="set phased update percentage")
+
+    # Deprecated in favour of -A.
+    parser.add_option(
+        "-d", "--distribution", default="ubuntu", help=SUPPRESS_HELP)
+    parser.add_option(
+        "-j", "--partner", default=False, action="store_true",
+        help=SUPPRESS_HELP)
+    options, args = parser.parse_args()
+
+    if (not options.component and not options.section and not options.priority
+            and options.percentage is None):
+        parser.error(
+            "You must override at least one of component, section, "
+            "priority, and percentage.")
+
+    options.launchpad = Launchpad.login_with(
+        "change-override", options.launchpad_instance, version="devel")
+    lputils.setup_location(options)
+
+    change_overrides(options, args)
+
+
+if __name__ == '__main__':
+    main()

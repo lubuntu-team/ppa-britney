@@ -1,0 +1,89 @@
+#!/usr/bin/python
+
+# Copyright (C) 2011  Iain Lane
+# Copyright (C) 2011  Stefano Rivera
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+from __future__ import print_function, unicode_literals
+
+from optparse import OptionParser
+import re
+
+from launchpadlib.launchpad import Launchpad
+
+
+def blacklist_package(options, pkg, reason):
+    try:
+        dsd = options.devel_series.getDifferencesTo(
+            source_package_name_filter=pkg, parent_series=options.sid)[0]
+    except IndexError:
+        print("Couldn't blacklist %s (no DSD)" % pkg)
+        return False
+
+    if dsd.status == "Blacklisted always":
+        print("%s already blacklisted" % pkg)
+        return False
+
+    if not options.dry_run:
+        dsd.blacklist(all=True, comment=reason)
+    return True
+
+
+def main():
+    parser = OptionParser(usage="usage: %prog [options] sync-blacklist.txt")
+    parser.add_option(
+        "-l", "--launchpad", dest="launchpad_instance", default="production")
+    parser.add_option(
+        "-n", "--dry-run", default=False, action="store_true",
+        help="don't actually blacklist anything")
+    options, args = parser.parse_args()
+    if len(args) < 1:
+        parser.error("requires input file as argument")
+    blacklist = args[0]
+
+    lp = Launchpad.login_with(
+        'sync-blacklist', options.launchpad_instance, version='devel')
+    ubuntu = lp.distributions['ubuntu']
+    debian = lp.distributions['debian']
+
+    options.devel_series = ubuntu.current_series
+    options.sid = debian.current_series
+
+    # Read blacklist
+    applicable_comments = []
+    with open(blacklist) as blacklist_file:
+        for line in blacklist_file:
+            if not line.strip():
+                applicable_comments = []
+                continue
+
+            m = re.match(r'^\s*([a-z0-9.+-]+)?\s*(?:#\s*(.+)?)?$', line)
+            source, comment = m.groups()
+            if source:
+                comments = applicable_comments[:]
+                if comment:
+                    comments.append(comment)
+                if not comments:
+                    comments.append("None given")
+                comments.append("(from sync-blacklist.txt)")
+                print("blacklisting %s (reason: %s)..."
+                      % (source, '; '.join(comments)), end="")
+                if blacklist_package(options, source, '\n'.join(comments)):
+                    print("done")
+            elif comment:
+                applicable_comments.append(comment)
+
+
+if __name__ == "__main__":
+    main()

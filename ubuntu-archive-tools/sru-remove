@@ -1,0 +1,159 @@
+#!/usr/bin/python
+
+# Copyright (C) 2015 Brian Murray <brian.murray@canonical.com>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+'''Remove an SRU fom the -proposed pocket for a release.
+
+Remove a package from the -proposed pocket for a release of Ubuntu and comment
+on bug reports regarding the removal of the package giving an explanation that
+it was removed to due a failure for the SRU bug(s) to be verified in a timely
+fashion.
+
+USAGE:
+    sru-remove -s trusty -p homerun 12345
+'''
+
+from __future__ import print_function
+
+import optparse
+import re
+import subprocess
+import sys
+
+from launchpadlib.launchpad import Launchpad
+
+
+def parse_options():
+    '''Parse command line arguments.
+
+    Return (options, [bugs]) tuple.
+    '''
+
+    parser = optparse.OptionParser(
+        usage='Usage: %prog [options]')
+    parser.add_option(
+        "-l", "--launchpad", dest="launchpad_instance", default="production")
+    parser.add_option(
+        "-s", dest="release", default=default_release, metavar="RELEASE",
+        help="release (default: %s)" % default_release)
+    parser.add_option(
+        "-p", "--package", dest="sourcepkg")
+
+    opts, args = parser.parse_args()
+
+    return (opts, args)
+
+
+def process_bug(launchpad, distroseries, sourcepkg, num):
+    bug_target_re = re.compile(
+        r'/ubuntu/(?:(?P<suite>[^/]+)/)?\+source/(?P<source>[^/]+)$')
+    bug = launchpad.bugs[num]
+    series_name = distroseries.name
+    open_task = False
+
+    for task in bug.bug_tasks:
+        # Ugly; we have to do URL-parsing to figure this out.
+        # /ubuntu/+source/foo can be fed to launchpad.load() to get a
+        # distribution_source_package, but /ubuntu/hardy/+source/foo can't.
+        match = bug_target_re.search(task.target.self_link)
+        if (not match or
+            (sourcepkg and
+             match.group('source') != sourcepkg)):
+            print("Ignoring task %s in bug %s" % (task.web_link, num))
+            continue
+        if (match.group('suite') != series_name and
+                match.group('suite') in supported_series and
+                task.status == "Fix Committed"):
+            open_task = True
+        if (match.group('suite') == series_name and
+                task.status == "Fix Committed"):
+            task.status = "Won't Fix"
+            task.lp_save()
+            print("Success: task %s in bug %s" % (task.web_link, num))
+        btags = bug.tags
+        series_v_needed = 'verification-needed-%s' % series_name
+        if series_v_needed in btags:
+            # this dance is needed due to
+            # https://bugs.launchpad.net/launchpadlib/+bug/254901
+            tags = btags
+            tags.remove(series_v_needed)
+            bug.tags = tags
+            bug.lp_save()
+
+        text = ('The version of %s in the proposed pocket of %s that was '
+                'purported to fix this bug report has been removed because '
+                'the bugs that were to be fixed by the upload were not '
+                'verified in a timely (105 days) fashion.' %
+                (sourcepkg, series_name.title()))
+        bug.newMessage(content=text,
+                       subject='Proposed package removed from archive')
+
+    # remove verification-needed tag if there are no open tasks
+    if open_task:
+        return
+    # only unsubscribe the teams if there are no open tasks left
+    bug.unsubscribe(person=launchpad.people['ubuntu-sru'])
+    bug.unsubscribe(person=launchpad.people['sru-verification'])
+    if 'verification-needed' in btags:
+        # this dance is needed due to
+        # https://bugs.launchpad.net/launchpadlib/+bug/254901
+        tags = btags
+        tags.remove('verification-needed')
+        bug.tags = tags
+        bug.lp_save()
+
+
+if __name__ == '__main__':
+
+    default_release = 'cosmic'
+    removal_comment = ('The package was removed due to its SRU bug(s) '
+                       'not being verified in a timely fashion.')
+
+    (opts, bugs) = parse_options()
+
+    launchpad = Launchpad.login_with('sru-remove', opts.launchpad_instance,
+                                     version="devel")
+    ubuntu = launchpad.distributions['ubuntu']
+    # determine series for which we issue SRUs
+    supported_series = []
+    for serie in ubuntu.series:
+        if serie.supported:
+            supported_series.append(serie.name)
+
+    series = ubuntu.getSeries(name_or_version=opts.release)
+    archive = ubuntu.main_archive
+
+    existing = [
+        pkg for pkg in archive.getPublishedSources(
+            exact_match=True, distro_series=series, pocket='Proposed',
+            source_name=opts.sourcepkg, status='Published')]
+
+    if not existing:
+        print("ERROR: %s was not found in -proposed for release %s." %
+              (opts.sourcepkg, opts.release), file=sys.stderr)
+        sys.exit(1)
+
+    rm_p_cmd = ["remove-package", "-m", removal_comment, "-y",
+                "-l", opts.launchpad_instance, "-s",
+                "%s-proposed" % opts.release, opts.sourcepkg]
+    ret = subprocess.call(rm_p_cmd)
+    if ret != 0:
+        print("ERROR: There was an error removing %s from %s-proposed.\n"
+              "The remove-package command returned %s." %
+              (opts.sourcepkg, opts.release, ret), file=sys.stderr)
+        sys.exit(1)
+    # only comment on the bugs after removing the package
+    for bug in bugs:
+        process_bug(launchpad, series, opts.sourcepkg, bug)

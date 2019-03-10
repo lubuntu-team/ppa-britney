@@ -1,0 +1,67 @@
+#! /usr/bin/python
+
+# Copyright (C) 2017  Canonical Ltd.
+# Author: Colin Watson <cjwatson@ubuntu.com>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+"""Mark a suite dirty.
+
+This is useful on the rare occasions when Launchpad needs to be forced to
+republish a suite even though it isn't itself aware of a reason to do so.
+"""
+
+from __future__ import print_function
+
+from optparse import OptionParser
+import sys
+
+from launchpadlib.launchpad import Launchpad
+
+import lputils
+
+
+def mark_suite_dirty(options):
+    if options.dry_run:
+        print(
+            "Would mark %s dirty in %s." % (options.suite, options.archive))
+    else:
+        options.archive.markSuiteDirty(
+            distroseries=options.series, pocket=options.pocket)
+        print("Marked %s dirty in %s." % (options.suite, options.archive))
+
+
+def main():
+    parser = OptionParser(
+        usage="usage: %prog -s suite",
+        epilog=lputils.ARCHIVE_REFERENCE_DESCRIPTION)
+    parser.add_option(
+        "-l", "--launchpad", dest="launchpad_instance", default="production")
+    parser.add_option(
+        "-n", "--dry-run", default=False, action="store_true",
+        help="only show what would be done")
+    parser.add_option("-A", "--archive", help="operate on ARCHIVE")
+    parser.add_option(
+        "-s", "--suite", metavar="SUITE", help="mark SUITE dirty")
+    options, _ = parser.parse_args()
+
+    options.distribution = "ubuntu"
+    options.launchpad = Launchpad.login_with(
+        "mark-suite-dirty", options.launchpad_instance, version="devel")
+    lputils.setup_location(options)
+
+    mark_suite_dirty(options)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

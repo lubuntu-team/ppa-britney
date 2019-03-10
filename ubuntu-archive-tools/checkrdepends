@@ -1,0 +1,300 @@
+#! /usr/bin/python
+
+# Copyright (C) 2009, 2010, 2011, 2012  Canonical Ltd.
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+from __future__ import print_function
+
+from collections import defaultdict
+import gzip
+import optparse
+import os
+import re
+import sys
+import tempfile
+
+import apt_pkg
+
+
+default_base = '/home/ubuntu-archive/mirror/ubuntu'
+default_suite = 'disco'
+components = ('main', 'restricted', 'universe', 'multiverse')
+
+# Cut-down RE from deb822.PkgRelation.
+re_dep = re.compile(r'^\s*([a-zA-Z0-9.+\-]{2,})')
+
+re_kernel_image_di = re.compile(r'^kernel-image-(.+)-di')
+
+
+# Cheaper version of deb822.PkgRelation.parse_relations.
+def parse_relation_packages(raw):
+    for or_dep in raw.split(','):
+        for dep in or_dep.split('|'):
+            match = re_dep.match(dep.strip())
+            if match:
+                yield match.group(1)
+
+
+def primary_arches(suite):
+    return ('amd64', 'i386')
+
+
+def ports_arches(suite):
+    if suite == 'lucid':
+        return ('armel', 'ia64', 'powerpc', 'sparc')
+    elif suite == 'precise':
+        return ('armel', 'armhf', 'powerpc')
+    elif suite in ('14.09', '14.09-factory'):
+        return ('armhf',)
+    elif suite in ('trusty', 'vivid', 'wily'):
+        return ('arm64', 'armhf', 'powerpc', 'ppc64el')
+    elif suite in ('xenial', 'yakkety'):
+        return ('arm64', 'armhf', 'powerpc', 'ppc64el', 's390x')
+    else:
+        return ('arm64', 'armhf', 'ppc64el', 's390x')
+
+
+def read_tag_file(path):
+    tmp = tempfile.NamedTemporaryFile(prefix='checkrdepends.', delete=False)
+    try:
+        compressed = gzip.open(path)
+        try:
+            tmp.write(compressed.read())
+        finally:
+            compressed.close()
+        tmp.close()
+        with open(tmp.name) as uncompressed:
+            tag_file = apt_pkg.TagFile(uncompressed)
+            prev_name = None
+            prev_stanza = None
+            for stanza in tag_file:
+                try:
+                    name = stanza['package']
+                except KeyError:
+                    continue
+                if name != prev_name and prev_stanza is not None:
+                    yield prev_stanza
+                prev_name = name
+                prev_stanza = stanza
+            if prev_stanza is not None:
+                yield prev_stanza
+    finally:
+        os.unlink(tmp.name)
+
+
+def read_sources(path):
+    ret = {
+        'binary': {},
+        'source': defaultdict(set),
+        'build_deps': defaultdict(set),
+    }
+    binary = ret['binary']
+    source = ret['source']
+    build_deps = ret['build_deps']
+    for stanza in read_tag_file(path):
+        if 'binary' not in stanza:
+            continue
+        name = stanza['package']
+        binpkgs = [b.rstrip(',') for b in stanza['binary'].split()]
+        binary[name] = binpkgs
+        for binpkg in binpkgs:
+            source[binpkg].add(stanza['package'])
+        for field in ('build-depends', 'build-depends-indep'):
+            if field not in stanza:
+                continue
+            for depname in parse_relation_packages(stanza[field]):
+                build_deps[depname].add(name)
+    return ret
+
+
+def read_packages(debs, path, sources, ignores=[], missing_ok=False):
+    ret = {'deps': defaultdict(dict)}
+    deps = ret['deps']
+    try:
+        for stanza in read_tag_file(path):
+            name = stanza['package']
+            for field in ('pre-depends', 'depends', 'recommends'):
+                if field not in stanza:
+                    continue
+                for depname in parse_relation_packages(stanza[field]):
+                    if depname not in debs:
+                        continue
+                    # skip dependencies that are built from the same source,
+                    # when we're doing a sourceful removal.
+                    if name in ignores:
+                        continue
+                    deps[depname][name] = (field, stanza['architecture'])
+    except IOError:
+        if not missing_ok:
+            raise
+    return ret
+
+
+def read_di(debs, path):
+    ret = set()
+    try:
+        with open(path) as manifest:
+            for line in manifest:
+                udeb = line.split()[0]
+                ret.add(udeb)
+                match = re_kernel_image_di.match(udeb)
+                if match:
+                    re_modules = re.compile(r'-modules-%s-di' % match.group(1))
+                    for pkg in debs:
+                        if re_modules.search(pkg):
+                            ret.add(pkg)
+    except IOError:
+        pass
+    return ret
+
+
+def pockets(opts):
+    if '-' in opts.suite:
+        return ('',)
+    else:
+        return ('', '-updates', '-security', '-backports')
+
+
+def render_dep(name, field, arch):
+    ret = name
+    if field == "recommends":
+        ret += " (r)"
+    if arch == "all":
+        ret += " [all]"
+    return ret
+
+
+def search(opts, pkgs):
+    for pocket in pockets(opts):
+        pocket_base = '%s/dists/%s%s' % (opts.archive_base, opts.suite, pocket)
+        if opts.arches:
+            arches = opts.arches
+        else:
+            arches = list(primary_arches(opts.suite))
+            if opts.ports:
+                arches.extend(ports_arches(opts.suite))
+
+        packages = defaultdict(dict)
+        sources = {}
+        for comp in components:
+            comp_base = '%s/%s' % (pocket_base, comp)
+            sources[comp] = read_sources('%s/source/Sources.gz' % comp_base)
+
+        if opts.binary:
+            debs = pkgs
+            ignores = []
+        else:
+            debs = set()
+            for src in pkgs:
+                for comp in components:
+                    if src in sources[comp]['binary']:
+                        debs.update(set(sources[comp]['binary'][src]))
+            ignores = debs = sorted(debs)
+
+        # Now we have the source<->binary mapping, we can read Packages
+        # files but only bother to remember the dependencies we need.
+        for comp in components:
+            comp_base = '%s/%s' % (pocket_base, comp)
+            di_comp = '%s/debian-installer' % comp
+            di_comp_base = '%s/%s' % (pocket_base, di_comp)
+
+            build_deps = sources[comp]['build_deps']
+            for deb in debs:
+                if opts.directory is not None:
+                    out = open(os.path.join(opts.directory, deb), 'a')
+                else:
+                    out = sys.stdout
+
+                # build dependencies
+                if deb in build_deps:
+                    print("-- %s%s/%s build deps on %s:" %
+                          (opts.suite, pocket, comp, deb), file=out)
+                    for pkg in sorted(build_deps[deb]):
+                        print(pkg, file=out)
+
+                # binary dependencies
+                for arch in arches:
+                    if arch not in packages[comp]:
+                        packages[comp][arch] = \
+                            read_packages(debs,
+                                          '%s/binary-%s/Packages.gz' %
+                                          (comp_base, arch),
+                                          sources[comp], ignores)
+                    if arch not in packages[di_comp]:
+                        packages[di_comp][arch] = \
+                            read_packages(debs,
+                                          '%s/binary-%s/Packages.gz' %
+                                          (di_comp_base, arch),
+                                          sources[comp], ignores,
+                                          missing_ok=True)
+                        if comp == 'main':
+                            di_images = \
+                                read_di(debs,
+                                        '%s/installer-%s/current/images/'
+                                        'udeb.list' % (comp_base, arch))
+                            di_deps = packages[di_comp][arch]['deps']
+                            for udeb in di_images:
+                                di_deps[udeb]['debian-installer-images'] = (
+                                    'depends', arch)
+
+                    deps = packages[comp][arch]['deps']
+                    di_deps = packages[di_comp][arch]['deps']
+                    if deb in deps:
+                        print("-- %s%s/%s %s deps on %s:" %
+                              (opts.suite, pocket, comp, arch, deb), file=out)
+                        for pkg, (field, pkgarch) in sorted(deps[deb].items()):
+                            print(render_dep(pkg, field, pkgarch), file=out)
+                    if deb in di_deps:
+                        print("-- %s%s/%s %s deps on %s:" %
+                              (opts.suite, pocket, di_comp, arch, deb),
+                              file=out)
+                        for pkg, (field, pkgarch) in sorted(
+                                di_deps[deb].items()):
+                            print(render_dep(pkg, field, pkgarch), file=out)
+
+                if opts.directory is not None:
+                    out.close()
+
+
+def main():
+    parser = optparse.OptionParser(usage='%prog [options] pkg [...]')
+    parser.add_option('-B', '--archive-base', dest='archive_base',
+                      help=('archive base directory (default: %s)' %
+                            default_base),
+                      default=default_base)
+    parser.add_option('-s', '--suite', dest='suite',
+                      help='suite to check (default: %s)' % default_suite,
+                      default=default_suite)
+    parser.add_option('-a', '--arch', dest='arches', action='append',
+                      help='check only this architecture '
+                           '(may be given multiple times)')
+    parser.add_option('-b', '--binary', dest='binary', action='store_true',
+                      help='treat arguments as binary packages, not source')
+    parser.add_option('--no-ports', dest='ports',
+                      default=True, action='store_false',
+                      help='skip ports architectures')
+    parser.add_option('-d', '--directory', dest='directory', metavar='DIR',
+                      help='output to directory DIR (one file per package) '
+                           'instead of standard output')
+    opts, args = parser.parse_args()
+
+    if 'CHECKRDEPENDS_PROFILE' in os.environ:
+        import profile
+        profile.run('search(opts, args)')
+    else:
+        search(opts, args)
+
+
+if __name__ == '__main__':
+    main()

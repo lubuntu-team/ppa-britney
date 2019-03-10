@@ -1,0 +1,165 @@
+#! /usr/bin/python
+
+from __future__ import print_function
+
+import atexit
+import bz2
+from collections import defaultdict
+import json
+import lzma
+from optparse import OptionParser
+import requests
+import shutil
+import sys
+import tempfile
+
+import apt_pkg
+from launchpadlib.launchpad import Launchpad
+
+import lputils
+
+
+tempdir = None
+
+
+def ensure_tempdir():
+    global tempdir
+    if not tempdir:
+        tempdir = tempfile.mkdtemp(prefix="unsubscribed-packages")
+        atexit.register(shutil.rmtree, tempdir)
+
+
+def decompress_open(tagfile):
+    if tagfile.startswith("http:") or tagfile.startswith("ftp:"):
+        url = tagfile
+        tagfile = requests.get(url)
+        if tagfile.status_code == 404:
+            url = url.replace(".xz", ".bz2")
+            tagfile = requests.get(url)
+
+    ensure_tempdir()
+    decompressed = tempfile.mktemp(dir=tempdir)
+    with open(decompressed, "wb") as fout:
+        if url.endswith(".xz"):
+            fout.write(lzma.decompress(tagfile.content))
+        elif url.endswith(".bz2"):
+            fout.write(bz2.decompress(tagfile.content))
+    return open(decompressed, "r")
+
+
+def archive_base(archtag):
+    if archtag in ("amd64", "i386", "src"):
+        return "http://archive.ubuntu.com/ubuntu"
+    else:
+        return "http://ports.ubuntu.com/ubuntu-ports"
+
+
+def source_names(options):
+    sources = dict()
+    for suite in options.suites:
+        for component in ["main", "restricted"]:
+            url = "%s/dists/%s/%s/source/Sources.xz" % (
+                archive_base("src"), suite, component)
+            if not options.quiet:
+                print("Reading %s ..." % url, file=sys.stderr)
+            for section in apt_pkg.TagFile(decompress_open(url)):
+                pkg = section["Package"]
+                if suite == options.dev_suite:
+                    sources[pkg] = True
+                else:
+                    if sources.get(pkg, False) == True:
+                        continue
+                    sources[pkg] = False
+    return sources
+
+
+def main():
+    parser = OptionParser(
+        description="Check for source packages in main or restricted in "
+                    "active distro series and return a json file of the teams "
+                    "to which they map.")
+    parser.add_option(
+        "-l", "--launchpad", dest="launchpad_instance", default="production")
+    parser.add_option(
+        "-u", "--unsubscribed", action="store_true", default=False,
+        help="Only return packages which have no subscriber")
+    parser.add_option(
+        "-p", "--print", action="store_true", default=False,
+        dest="display",
+        help="Print results to screen instead of a json file")
+    parser.add_option(
+        "-o", "--output-file", default="package-team-mapping.json",
+        help="output JSON to this file")
+    parser.add_option(
+        "-q", "--quiet", action="store_true", default=False,
+        help="Quieten progress messages")
+    options, _ = parser.parse_args()
+    options.suite = None
+    options.distribution = "ubuntu"
+    options.launchpad = Launchpad.login_with(
+        "unsubscribed-packages", options.launchpad_instance)
+    launchpad = options.launchpad
+    ubuntu = launchpad.distributions[options.distribution]
+    options.suites = []
+    for series in ubuntu.series:
+        # very few lucid packages are supported
+        if series.name == 'lucid':
+            continue
+        if series.active:
+            options.suites.append(series.name)
+        # find the dev series
+        if series.status in ['Active Development', 'Pre-release Freeze']:
+            options.dev_suite = series.name
+
+    lputils.setup_location(options)
+
+    team_names = [
+        'checkbox-bugs',
+        'desktop-packages',
+        'documentation-packages',
+        'foundations-bugs',
+        'kernel-packages',
+        'kubuntu-bugs',
+        'landscape',
+        'maas-maintainers',
+        'mir-team',
+        'pkg-ime',
+        'snappy-dev',
+        'translators-packages',
+        'ubuntu-openstack',
+        'ubuntu-printing',
+        'ubuntu-security',
+        'ubuntu-server',
+        ]
+
+    data = { "unsubscribed": [] }
+    subscriptions = defaultdict(list)
+    for team_name in team_names:
+        data[team_name] = []
+        team = launchpad.people[team_name]
+        team_subs = team.getBugSubscriberPackages()
+        for src_pkg in team_subs:
+            subscriptions[src_pkg.name].append(team_name)
+            data[team_name].append(src_pkg.name)
+
+    source_packages = source_names(options)
+    for source_package in sorted(source_packages):
+        # we only care about ones people are not subscribed to in the dev release
+        if source_package not in subscriptions and source_packages[source_package]:
+            data["unsubscribed"].append(source_package)
+            if options.display:
+                print("No team is subscribed to: %s" %
+                      source_package)
+        else:
+            if not options.unsubscribed:
+                if options.display:
+                    print("%s is subscribed to: %s" %
+                          (team_name, source_package))
+
+    if not options.display:
+        with open(options.output_file, 'w') as json_file:
+            json_file.write(json.dumps(data, indent=4))
+
+
+if __name__ == '__main__':
+    main()

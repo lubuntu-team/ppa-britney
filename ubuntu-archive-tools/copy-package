@@ -1,0 +1,258 @@
+#! /usr/bin/python
+
+# Copyright (C) 2012  Canonical Ltd.
+# Author: Colin Watson <cjwatson@ubuntu.com>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+"""Copy package publication records."""
+
+from __future__ import print_function
+
+import argparse
+import sys
+
+from launchpadlib.errors import HTTPError
+from launchpadlib.launchpad import Launchpad
+try:
+    from ubuntutools.question import YesNoQuestion
+except ImportError:
+    print("No ubuntutools installed: sudo apt-get install ubuntu-dev-tools")
+    exit()
+
+import lputils
+
+
+def find_publications(args, package):
+    source = lputils.find_latest_published_source(args, package)
+    yield source, source.source_package_version
+
+    if args.include_binaries:
+        for binary in source.getPublishedBinaries():
+            yield binary, binary.binary_package_version
+
+
+def copy_packages(args):
+    ret = True
+
+    for package in args.packages:
+        print("Copy candidates:")
+
+        try:
+            source = lputils.find_latest_published_source(args, package)
+        except lputils.PackageMissing as error:
+            print(error)
+            if args.skip_missing:
+                print('Skipping')
+                continue
+            else:
+                # Bail with exit code non-zero.
+                return False
+        print("\t%s" % source.display_name)
+        num_copies = 1
+
+        if args.include_binaries:
+            for binary in source.getPublishedBinaries():
+                print("\t%s" % binary.display_name)
+                num_copies += 1
+
+        print("Candidate copy target: %s" % args.destination.archive)
+        if args.sponsoree:
+            print("Sponsored for: %s" % args.sponsoree)
+        if args.dry_run:
+            print("Dry run; no packages copied.")
+        else:
+            if not args.confirm_all:
+                if YesNoQuestion().ask("Copy", "no") == "no":
+                    continue
+
+            try:
+                args.destination.archive.copyPackage(
+                    source_name=package, version=source.source_package_version,
+                    from_archive=args.archive,
+                    from_series=args.series.name,
+                    from_pocket=args.pocket,
+                    to_series=args.destination.series.name,
+                    to_pocket=args.destination.pocket,
+                    include_binaries=args.include_binaries,
+                    unembargo=args.unembargo,
+                    auto_approve=args.auto_approve,
+                    silent=args.silent,
+                    sponsored=args.sponsoree)
+
+                print("%d %s requested." % (
+                    num_copies, "copy" if num_copies == 1 else "copies"))
+            except HTTPError as e:
+                print(e.content, file=sys.stderr)
+                ret = False
+
+    return ret
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        epilog=lputils.ARCHIVE_REFERENCE_DESCRIPTION)
+    parser.add_argument(
+        "-l", "--launchpad", dest="launchpad_instance", default="production")
+    parser.add_argument(
+        "-n", "--dry-run", default=False, action="store_true",
+        help="only show copies that would be performed")
+    parser.add_argument(
+        "-y", "--confirm-all", default=False, action="store_true",
+        help="do not ask for confirmation")
+    parser.add_argument(
+        "--from", metavar="ARCHIVE", dest="archive",
+        help="copy from ARCHIVE (default: ubuntu)")
+    parser.add_argument(
+        "-s", "--suite", "--from-suite", metavar="SUITE",
+        help="copy from SUITE (default: development release pocket)")
+    parser.add_argument(
+        "--to", metavar="ARCHIVE",
+        help="copy to ARCHIVE (default: copy from archive)")
+    parser.add_argument(
+        "--to-suite", metavar="SUITE",
+        help="copy to SUITE (default: copy from suite)")
+    parser.add_argument(
+        "-e", "--version",
+        metavar="VERSION", help="package version (default: current version)")
+    parser.add_argument(
+        "-b", "--include-binaries", default=False, action="store_true",
+        help="copy related binaries")
+    parser.add_argument(
+        "--unembargo", default=False, action="store_true",
+        help="allow copying from a private archive to a public archive")
+    parser.add_argument(
+        "--auto-approve", default=False, action="store_true",
+        help="automatically approve copy (requires queue admin permissions)")
+    parser.add_argument(
+        "--silent", default=False, action="store_true",
+        help="suppress mail notifications (requires queue admin permissions)")
+    parser.add_argument(
+        "--force-same-destination", default=False, action="store_true",
+        help=(
+            "force copy when source == destination (e.g. when reverting to "
+            "a previous version in the same suite)"))
+    parser.add_argument(
+        "--skip-missing", default=False, action="store_true",
+        help=(
+            "When a package cannot be copied, normally this script exits "
+            "with a non-zero status.  With --skip-missing instead, the "
+            "error is printed and copying continues"))
+    parser.add_argument(
+        "--sponsor", metavar="USERNAME", dest="sponsoree", default=None,
+        help="Sponsor the sync for USERNAME (a Launchpad username).")
+
+    # Deprecated in favour of --to and --from.
+    parser.add_argument(
+        "-d", "--distribution", default="ubuntu", help=argparse.SUPPRESS)
+    parser.add_argument("-p", "--ppa", help=argparse.SUPPRESS)
+    parser.add_argument("--ppa-name", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "-j", "--partner", default=False, action="store_true",
+        help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--to-primary", default=False, action="store_true",
+        help=argparse.SUPPRESS)
+    parser.add_argument("--to-distribution", help=argparse.SUPPRESS)
+    parser.add_argument("--to-ppa", help=argparse.SUPPRESS)
+    parser.add_argument("--to-ppa-name", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--to-partner", default=False, action="store_true",
+        help=argparse.SUPPRESS)
+
+    parser.add_argument(
+        "packages", metavar="package", nargs="+",
+        help="name of package to copy")
+
+    args = parser.parse_args()
+
+    args.launchpad = Launchpad.login_with(
+        "copy-package", args.launchpad_instance, version="devel")
+    args.destination = argparse.Namespace()
+    args.destination.launchpad = args.launchpad
+    args.destination.suite = args.to_suite or args.suite
+
+    if args.archive or args.to:
+        # Use modern single-option archive references.
+        if ((args.distribution and args.distribution != u'ubuntu') or
+            args.ppa or args.ppa_name or args.partner or
+            args.to_distribution or args.to_ppa or
+            args.to_ppa_name or args.to_partner):
+            parser.error(
+                "cannot use --to/--from and the deprecated archive selection "
+                "options together")
+        args.destination.archive = args.to or args.archive
+    else:
+        # Use the deprecated four-option archive specifiers.
+        if args.ppa and args.partner:
+            parser.error(
+                "cannot copy from partner archive and PPA simultaneously")
+        if args.to_ppa and args.to_partner:
+            parser.error(
+                "cannot copy to partner archive and PPA simultaneously")
+
+        args.destination.distribution = (
+            args.to_distribution or args.distribution)
+        args.destination.ppa = args.to_ppa
+        args.destination.ppa_name = args.to_ppa_name
+        args.destination.partner = args.to_partner
+
+        # In cases where source is specified, but destination is not,
+        # default to destination = source
+        if (args.ppa is not None and args.to_ppa is None and
+                not args.to_primary and not args.destination.partner):
+            args.destination.ppa = args.ppa
+        if (args.ppa_name is not None and args.to_ppa_name is None and
+                args.destination.ppa is not None):
+            args.destination.ppa_name = args.ppa_name
+        if (args.partner and not args.destination.partner and
+                not args.ppa):
+            args.destination.partner = args.partner
+
+        if args.to_primary and args.to_ppa_name is not None:
+            parser.error(
+                "--to-ppa-name option set for copy to primary archive")
+
+    lputils.setup_location(args)
+    lputils.setup_location(args.destination)
+
+    if args.archive.private and not args.destination.archive.private:
+        if not args.unembargo:
+            parser.error(
+                "copying from a private archive to a public archive requires "
+                "the --unembargo option")
+
+        # TODO some equivalent of canModifySuite check?
+
+    if (not args.force_same_destination and
+            args.distribution == args.destination.distribution and
+            args.suite == args.destination.suite and
+            args.pocket == args.destination.pocket and
+            args.archive.reference == args.destination.archive.reference):
+        parser.error("copy destination must differ from source")
+
+    if args.sponsoree:
+        try:
+            args.sponsoree = args.launchpad.people[args.sponsoree]
+        except KeyError:
+            parser.error(
+                "Person to sponsor for not found: %s" % args.sponsoree)
+
+    if copy_packages(args):
+        return 0
+    else:
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

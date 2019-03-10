@@ -1,0 +1,192 @@
+#!/usr/bin/python3
+# Generate a list of autopkgtest request.cgi URLs to
+# re-run all autopkgtests which regressed
+# Copyright (C) 2015-2016 Canonical Ltd.
+# Author: Martin Pitt <martin.pitt@ubuntu.com>
+
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public
+# License as published by the Free Software Foundation; either
+# version 2.1 of the License, or (at your option) any later version.
+
+# This library is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# Lesser General Public License for more details.
+
+# You should have received a copy of the GNU Lesser General Public
+# License along with this library; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301
+# USA
+
+from datetime import datetime
+import dateutil.parser
+from dateutil.tz import tzutc
+import urllib.request
+import urllib.parse
+import argparse
+import os
+import re
+import yaml
+import json
+
+request_url = 'https://autopkgtest.ubuntu.com/request.cgi'
+default_series = 'disco'
+args = None
+
+
+def get_cache_dir():
+    cache_dir = os.environ.get('XDG_CACHE_HOME',
+                               os.path.expanduser(os.path.join('~', '.cache')))
+    uat_cache = os.path.join(cache_dir, 'ubuntu-archive-tools')
+    os.makedirs(uat_cache, exist_ok=True)
+    return uat_cache
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        'Generate %s URLs to re-run regressions' % request_url,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description='''Typical workflow:
+ - export autopkgtest.ubuntu.com session cookie into ~/.cache/autopkgtest.cookie
+   Use a browser plugin or get the value from the settings and create it with
+   printf "autopkgtest.ubuntu.com\\tTRUE\\t/\\tTRUE\\t0\\tsession\\tVALUE\\n" > ~/.cache/autopkgtest.cookie
+   (The cookie is valid for one month)
+
+ - retry-autopkgtest-regressions [opts...] | vipe | xargs -rn1 -P10 wget --load-cookies ~/.cache/autopkgtest.cookie -O-
+   edit URL list to pick/remove requests as desired, then close editor to let it run
+''')
+    parser.add_argument('-s', '--series', default=default_series,
+                        help='Ubuntu series (default: %(default)s)')
+    parser.add_argument('--bileto', metavar='TICKETNUMBER',
+                        help='Run for bileto ticket')
+    parser.add_argument('--all-proposed', action='store_true',
+                        help='run tests against all of proposed, i. e. with disabling apt pinning')
+    parser.add_argument('--state', default='REGRESSION',
+                        help='generate commands for given test state (default: %(default)s)')
+    parser.add_argument('--max-age', type=float, metavar='DAYS',
+                        help='only consider candiates which are at most '
+                        'this number of days old (float allowed)')
+    parser.add_argument('--min-age', type=float, metavar='DAYS',
+                        help='only consider candiates which are at least '
+                        'this number of days old (float allowed)')
+    parser.add_argument('--blocks',
+                        help='rerun only those tests that were triggered '
+                        'by the named package')
+    parser.add_argument('--no-proposed', action='store_true',
+                        help='run tests against release+updates instead of '
+                        'against proposed, to re-establish a baseline for the '
+                        'test.  This currently only works for packages that '
+                        'do not themselves have a newer version in proposed.')
+    args = parser.parse_args()
+
+    return args
+
+
+def get_regressions(excuses_url, release, retry_state, min_age, max_age,
+                    blocks, no_proposed):
+    '''Return dictionary with regressions
+
+    Return dict: release → pkg → arch → [trigger, ...]
+    '''
+    cache_file = None
+
+    # load YAML excuses
+
+    # ignore bileto urls wrt caching, they're usually too small to matter
+    # and we don't do proper cache expiry
+    m = re.search('people.canonical.com/~ubuntu-archive/proposed-migration/'
+                  '([^/]*)/([^/]*)',
+                  excuses_url)
+    if m:
+        cache_dir = get_cache_dir()
+        cache_file = os.path.join(cache_dir, '%s_%s' % (m.group(1), m.group(2)))
+        try:
+            prev_mtime = os.stat(cache_file).st_mtime
+        except FileNotFoundError:
+            prev_mtime = 0
+        prev_timestamp = datetime.fromtimestamp(prev_mtime, tz=tzutc())
+        new_timestamp = datetime.now(tz=tzutc()).timestamp()
+
+    f = urllib.request.urlopen(excuses_url)
+    if cache_file:
+        remote_ts = dateutil.parser.parse(f.headers['last-modified'])
+        if remote_ts > prev_timestamp:
+            with open('%s.new' % cache_file, 'wb') as new_cache:
+                for line in f:
+                    new_cache.write(line)
+            os.rename('%s.new' % cache_file, cache_file)
+            os.utime(cache_file, times=(new_timestamp, new_timestamp))
+        f.close()
+        f = open(cache_file, 'rb')
+
+    excuses = yaml.load(f, Loader=yaml.CSafeLoader)
+    f.close()
+    regressions = {}
+    for excuse in excuses['sources']:
+        if blocks and blocks != excuse['source']:
+            continue
+        try:
+            age = excuse['policy_info']['age']['current-age']
+        except KeyError:
+            age = None
+
+        # excuses are sorted by ascending age
+        if min_age is not None and age is not None and age < min_age:
+            continue
+        if max_age is not None and age is not None and age > max_age:
+            break
+        for pkg, archinfo in excuse.get('policy_info', {}).get('autopkgtest', {}).items():
+            try:
+                pkg, pkg_ver = re.split('[ /]+', pkg, 1) # split off version (either / or space separated)
+            # error and the package version is unknown
+            except ValueError:
+                pass
+            if no_proposed:
+                trigger = pkg + '/' + pkg_ver
+            else:
+                trigger = excuse['source'] + '/' + excuse['new-version']
+            for arch, state in archinfo.items():
+                if state[0] == retry_state:
+                    regressions.setdefault(release, {}).setdefault(
+                        pkg, {}).setdefault(arch, []).append(trigger)
+
+    return regressions
+
+
+args = parse_args()
+
+extra_params = []
+if args.all_proposed:
+    extra_params.append(('all-proposed', '1'))
+
+if args.bileto:
+    url_root = 'https://bileto.ubuntu.com'
+    ticket_url = url_root + '/v2/ticket/%s' % args.bileto
+    excuses_url = None
+    with urllib.request.urlopen(ticket_url) as f:
+        ticket = json.loads(f.read().decode('utf-8'))['tickets'][0]
+    ppa_name = ticket.get('ppa', '')
+    for line in ticket.get('autopkgtest', '').splitlines():
+        if args.series in line:
+            excuses_url = line
+            break
+    if excuses_url.startswith('/'):
+        excuses_url = url_root + excuses_url
+    excuses_url = excuses_url.replace('.html', '.yaml')
+    extra_params += [('ppa', 'ci-train-ppa-service/stable-phone-overlay'),
+                     ('ppa', 'ci-train-ppa-service/%s' % ppa_name)]
+else:
+    excuses_url = 'http://people.canonical.com/~ubuntu-archive/proposed-migration/%s/update_excuses.yaml' % args.series
+regressions = get_regressions(excuses_url, args.series, args.state,
+                              args.min_age, args.max_age, args.blocks,
+                              args.no_proposed)
+
+for release, pkgmap in regressions.items():
+    for pkg, archmap in pkgmap.items():
+        for arch, triggers in archmap.items():
+            params = [('release', release), ('arch', arch), ('package', pkg)]
+            params += [('trigger', t) for t in triggers]
+            params += extra_params
+            url = request_url + '?' + urllib.parse.urlencode(params)
+            print(url)

@@ -1,0 +1,106 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+
+# Copyright (C) 2013 Canonical Ltd.
+# Author: Stéphane Graber <stgraber@ubuntu.com>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+import argparse
+import os
+import time
+
+from launchpadlib.launchpad import Launchpad
+from codecs import open
+
+parser = argparse.ArgumentParser(
+    description="Generate list of packages and uploaders for all packagesets.")
+parser.add_argument("target", metavar="TARGET",
+                    help="Target directory")
+parser.add_argument("-a", "--all", action="store_true",
+                    help="Sync all series instead of just the active ones")
+args = parser.parse_args()
+
+# Authenticated login to Launchpad as anonymous
+# doesn't let us list the uploaders
+lp = Launchpad.login_with('package_sets_report', 'production')
+
+ubuntu = lp.distributions['ubuntu']
+
+# Get the list of series
+if args.all:
+    ubuntu_series = [series for series in ubuntu.series
+                     if series.status != "Future"]
+else:
+    ubuntu_series = [series for series in ubuntu.series if series.active]
+
+# cache
+teams = {}
+
+for series in ubuntu_series:
+    series_name = str(series.name)
+
+    if not os.path.exists(os.path.join(args.target, series_name)):
+        os.makedirs(os.path.join(args.target, series_name))
+
+    for pkgset in lp.packagesets.getBySeries(distroseries=series):
+        report = ""
+        report += "Name: %s\n" % pkgset.name
+        report += "Description: %s\n" % pkgset.description
+        report += "Owner: %s\n" % pkgset.owner.display_name
+        report += "Creation date: %s\n" % pkgset.date_created
+
+        # List all the source packages
+        report += "\nPackages:\n"
+        for pkg in sorted(list(pkgset.getSourcesIncluded())):
+            report += " - %s\n" % str(pkg)
+
+        # List all the sub-package sets
+        report += "\nSub-package sets:\n"
+        for child in sorted(list(pkgset.setsIncluded(direct_inclusion=True))):
+            report += " - %s\n" % child.name
+
+        # List all the uploaders, when it's a team, show the members count
+        report += "\nUploaders:\n"
+        for archive in ubuntu.archives:
+            for uploader in sorted(list(archive.getUploadersForPackageset(
+                    packageset=pkgset)),
+                    key=lambda uploader: uploader.person.display_name):
+
+                if uploader.person.is_team:
+                    if not uploader.person.name in teams:
+                        team = uploader.person
+                        teams[uploader.person.name] = team
+                    else:
+                        team = teams[uploader.person.name]
+
+                    report += " - %s (%s) (%s) (%s) (%s members)\n" % \
+                              (team.display_name,
+                               team.name,
+                               uploader.permission,
+                               archive.displayname,
+                               len(team.members))
+                    for member in sorted(list(team.members),
+                                         key=lambda person: person.name):
+                        report += "   - %s (%s)\n" % (member.display_name,
+                                                      member.name)
+                else:
+                    report += " - %s (%s) (%s)\n" % \
+                              (uploader.person.name,
+                               uploader.person.display_name,
+                               uploader.permission)
+
+        report += "\nGenerated at: %s\n" % time.asctime()
+        with open(os.path.join(args.target, series_name, pkgset.name),
+                  "w+", encoding="utf-8") as fd:
+            fd.write(report)

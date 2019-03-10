@@ -1,0 +1,93 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+
+# Copyright (C) 2013 Canonical Ltd.
+# Author: Stéphane Graber <stgraber@ubuntu.com>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+from __future__ import print_function
+from launchpadlib.launchpad import Launchpad
+
+import argparse
+import os
+
+parser = argparse.ArgumentParser(
+    description="Generate a user readable report of all archive permissions")
+parser.add_argument("target", metavar="TARGET",
+                    help="Target directory")
+args = parser.parse_args()
+
+if not os.path.exists(args.target):
+    os.makedirs(args.target)
+
+lp = Launchpad.login_with('permissions', 'production', version="devel")
+
+entries = {"teams": {}, "individuals": {}}
+
+for archive in lp.distributions['ubuntu'].archives:
+    for permission in archive.getAllPermissions():
+        if permission.person.is_team:
+            target = "teams"
+        else:
+            target = "individuals"
+
+        if not permission.person.name in entries[target]:
+            entries[target][permission.person.name] = []
+
+        if permission.component_name:
+            entry = "%s: component '%s'" % (permission.permission,
+                                            permission.component_name)
+            if permission.distro_series_name:
+                entry += " for '%s'" % (permission.distro_series_name)
+            entries[target][permission.person.name].append(entry)
+
+        if permission.package_set_name:
+            entry = "%s: packageset '%s'" % (permission.permission,
+                                             permission.package_set_name)
+            if permission.distro_series_name:
+                entry += " for '%s'" % (permission.distro_series_name)
+            entries[target][permission.person.name].append(entry)
+
+        if permission.source_package_name:
+            entry = "%s: source '%s'" % (permission.permission,
+                                         permission.source_package_name)
+            if permission.distro_series_name:
+                entry += " for '%s'" % (permission.distro_series_name)
+            entries[target][permission.person.name].append(entry)
+
+        if permission.pocket:
+            entry = "%s: pocket '%s'" % (permission.permission,
+                                         permission.pocket)
+            if permission.distro_series_name:
+                entry += " for '%s'" % (permission.distro_series_name)
+            entries[target][permission.person.name].append(entry)
+
+ubuntudev = [person.name
+             for person in lp.people['ubuntu-dev'].getMembersByStatus(
+                 status="Approved")]
+
+# Add known exceptions:
+ubuntudev += ["ubuntu-backporters", "ubuntu-security", "ubuntu-archive",
+              "ubuntu-release", "ubuntu-sru"]
+
+for target, people in entries.items():
+    with open(os.path.join(args.target, target), "w+") as fd:
+        for user, permissions in sorted(people.items()):
+            fd.write("=== %s ===\n" % user)
+            if user not in ubuntudev:
+                fd.write("Isn't a direct member of ~ubuntu-dev!\n")
+
+            for package in sorted(permissions):
+                fd.write(" - %s\n" % package)
+            fd.write("\n")

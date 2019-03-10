@@ -1,0 +1,730 @@
+#!/usr/bin/python
+
+# Copyright (C) 2013 Canonical Ltd.
+# Author: Brian Murray <brian.murray@canonical.com>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+'''Increment the Phased-Update-Percentage for a package
+
+Check to see whether or not there is a regression (new crash bucket or
+increase in rate of errors about a package) using errors.ubuntu.com and if
+not increment the Phased-Update-Percentage for the package.
+Additionally, generate an html report regarding state of phasing of
+packages and email uploaders regarding issues with their uploads.
+'''
+
+from __future__ import print_function
+
+import apt
+import codecs
+import csv
+import datetime
+import lazr
+import logging
+import os
+import simplejson as json
+import time
+
+from collections import defaultdict, OrderedDict
+from email import utils
+from optparse import OptionParser
+
+import lputils
+
+try:
+    from urllib.parse import quote
+    from urllib.request import urlopen
+except ImportError:
+    from urllib import quote, urlopen
+
+from launchpadlib.launchpad import Launchpad
+
+
+def get_primary_email(lp_user):
+    try:
+        lp_user_email = lp_user.preferred_email_address.email
+    except ValueError as e:
+        if 'server-side permission' in e.message:
+            logging.info("%s has hidden their email addresses" %
+                         lp_user.web_link)
+            return ''
+        logging.info("Error accessing %s's preferred email address: %s" %
+                     (lp_user.web_link, e.message))
+        return ''
+    return lp_user_email
+
+
+def set_pup(current_pup, new_pup, release, suite, src_pkg):
+    options.series = release
+    options.suite = suite
+    options.pocket = 'Updates'
+    options.version = None
+    source = lputils.find_latest_published_source(options, src_pkg)
+    publications = [
+        binary for binary in source.getPublishedBinaries()
+        if not binary.is_debug]
+
+    for pub in publications:
+        if pub.status != 'Published':
+            continue
+        pub.changeOverride(new_phased_update_percentage=new_pup)
+        if new_pup != 0:
+            logging.info('Incremented p-u-p for %s %s from %s%% to %s%%' %
+                         (suite, pub.binary_package_name,
+                          current_pup, new_pup))
+        else:
+            logging.info('Set p-u-p to 0%% from %s%% for %s %s' %
+                         (current_pup, suite, pub.binary_package_name))
+
+
+def generate_html_report(releases, buckets):
+    import tempfile
+    import shutil
+    with tempfile.NamedTemporaryFile() as report:
+        report.write('''<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN"
+ "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
+<head>
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+  <title>Released Ubuntu SRUs</title>
+  <style type="text/css">
+    body { background: #CCCCB0; color: black; }
+    a { text-decoration: none; }
+    table { border-collapse: collapse; border-style: solid none;
+            border-width: 3px; margin-bottom: 3ex; empty-cells: show; }
+    table th { text-align: left; border-style: none none dotted none;
+               border-width: 1px; padding-right: 10px; }
+    table td { text-align: left; border-style: none none dotted none;
+               border-width: 1px; padding-right: 10px; }
+    .noborder { border-style: none; }
+    a { color: blue; }
+    a:visited { color: black; }
+  </style>
+</head>
+<body>
+<h1>Phasing %sUbuntu Stable Release Updates</h1>
+''' % ('', 'and Released ')[options.fully_phased])
+        report.write(
+            '<p>Generated: %s by '
+            '<a href="http://bazaar.launchpad.net/'
+            '~ubuntu-archive/ubuntu-archive-tools/trunk/annotate/head%%3A/'
+            'phased-updater">phased-updater</a></p>' %
+            time.strftime('%F %T UTC', time.gmtime()))
+        report.write('''<p>A <a
+href="https://wiki.ubuntu.com/StableReleaseUpdates ">stable release
+update</a> has been created for the following packages, i. e.  they have
+a new version in -updates, and either an increased rate of crashes has
+been detected or an error has been found that only exists with the new
+version of the package.\n''')
+        for release in releases:
+            rname = release.name
+            if not buckets[rname]:
+                continue
+            report.write('''<h3>%s</h3>\n''' % rname)
+            report.write('''<table>\n''')
+            report.write('''<tr>
+      <th>Package</th>
+      <th>Version</th>
+      <th>Update Percentage</th>
+      <th>Rate Increase</th>
+      <th>Problems</th>
+      <th>Days</th>
+    </tr>''')
+            for pub_source in buckets[rname]:
+                pkg = pub_source.source_package_name
+                version = pub_source.source_package_version
+                age = (datetime.datetime.now() -
+                       pub_source.date_published.replace(tzinfo=None)).days
+                update_percentage = buckets[rname][pub_source].get('pup', 100)
+                if not options.fully_phased and update_percentage == 100:
+                    continue
+                lpurl = '%s/ubuntu/+source/%s/' % (LP_BASE_URL, pkg)
+                report.write('''<tr>
+      <td><a href="%s">%s</a></td>
+      <td><a href="%s">%s</a></td>\n''' %
+                             (lpurl, pkg, lpurl + version, version))
+                report.write('  <td>')
+                if update_percentage == 0:
+                    binary_pub = pub_source.getPublishedBinaries()[0]
+                    arch = binary_pub.distro_arch_series.architecture_tag
+                    bpph_url = ('%s/ubuntu/%s/%s/%s' %
+                                (LP_BASE_URL, rname, arch,
+                                 binary_pub.binary_package_name))
+                    report.write('<a href="%s">%s%% of users' %
+                                 (bpph_url, update_percentage))
+                    previous_pup = \
+                        buckets[rname][pub_source]['previous_pup']
+                    if previous_pup != 0:
+                        report.write(' (was %s%%)</a>' % previous_pup)
+                    else:
+                        report.write('</a>')
+                else:
+                    report.write('%s%% of users' % update_percentage)
+                report.write('</td>\n')
+                if 'rate' in buckets[rname][pub_source]:
+                    data = buckets[rname][pub_source]['rate']
+                    report.write('  <td><a href="%s">+%s</a></td>\n' %
+                                 (data[1], data[0]))
+                else:
+                    report.write('  <td></td>\n')
+                report.write('  <td>')
+                if 'buckets' in buckets[rname][pub_source]:
+                    # TODO: it'd be great if these were sorted
+                    for bucket in buckets[rname][pub_source]['buckets']:
+                        if 'problem' in bucket:
+                            # create a short version of the problem's hash
+                            phash = bucket.replace(
+                                'https://errors.ubuntu.com/problem/', '')[0:6]
+                            report.write('<a href="%s">%s</a> ' % (bucket,
+                                         phash))
+                        else:
+                            report.write('<a href="%s">problem</a> ' % bucket)
+                else:
+                    report.write('')
+                report.write('</td>\n')
+                report.write('  <td>%s</td>\n' % age)
+                report.write('</tr>\n')
+            report.write('''</table>\n''')
+        report.write('''</body>\n''')
+        report.write('''</html>''')
+        report.flush()
+        shutil.copy2(report.name, '%s/%s' % (os.getcwd(), REPORT_FILE))
+        os.chmod('%s/%s' % (os.getcwd(), REPORT_FILE), 0o644)
+
+
+def create_email_notifications(releases, spph_buckets):
+    import smtplib
+    from email.mime.text import MIMEText
+    notifications = defaultdict(list)
+    try:
+        with codecs.open(NOTIFICATIONS, 'r', encoding='utf-8') as notify_file:
+            for line in notify_file.readlines():
+                line = line.strip('\n').split(', ')
+                # LP name, problem, pkg_version
+                person = line[0]
+                problem = line[1]
+                pkg = line[2]
+                pkg_version = line[3]
+                notifications[person].append((problem, pkg, pkg_version))
+    except IOError:
+        pass
+    bdmurray_mail = 'brian@ubuntu.com'
+    b_body = ('Your upload of %s version %s to %s has resulted in %s'
+              'error%s that %s first reported about this version of the '
+              'package.  The error%s follow%s:\n\n'
+              '%s\n\n')
+    i_body = ('Your upload of %s version %s to %s has resulted in an '
+              'increased daily rate of errors for the package compared '
+              'to the previous two weeks. For problems currently being '
+              'reported about the package see:\n\n'
+              '%s&period=week\n\n')
+    remedy = ('You can view the current status of the phasing of all '
+              'Stable Release Updates, including yours, at:\n\n'
+              'http://people.canonical.com/~ubuntu-archive/%s\n\n'
+              'Further phasing of this update has been stopped until the '
+              'errors have either been fixed or determined to not be a '
+              'result of this Stable Release Update.  In the event of '
+              'the latter please let a member of the Ubuntu Stable Release '
+              'Updates team (~ubuntu-sru) know so that phasing of the update '
+              'can proceed.' % (REPORT_FILE))
+    for release in releases:
+        rname = release.name
+        for spph in spph_buckets[rname]:
+            update_percentage = spph_buckets[rname][spph].get('pup', 100)
+            # never send emails about updates that are fully phased
+            if update_percentage == 100:
+                continue
+            if 'buckets' not in spph_buckets[rname][spph] and \
+                    'rate' not in spph_buckets[rname][spph]:
+                continue
+            signer = spph.package_signer
+            # copies of packages from debian won't have a signer
+            if not signer:
+                continue
+            # not an active user of Launchpad
+            if not signer.is_valid:
+                logging.info('%s not mailed as they are not a valid LP user' %
+                             signer)
+                continue
+            signer_email = get_primary_email(signer)
+            signer_name = signer.name
+            # use the changes file as a backup method for determining email addresses
+            changes_file_url = spph.changesFileUrl()
+            try:
+                changes_file = urlopen(changes_file_url)
+                for line in changes_file.readlines():
+                    line = line.strip()
+                    if line.startswith('Changed-By:'):
+                        changer = line.lstrip('Changed-By: ').decode('utf-8')
+                        changer_name, changer_email = utils.parseaddr(changer.strip())
+                        break
+            except IOError:
+                pass
+            creator = spph.package_creator
+            creator_email = ''
+            pkg = spph.source_package_name
+            version = spph.source_package_version
+            if not signer_email and signer_name == creator.name:
+                if not changer_email:
+                    logging.info("No contact email found for %s %s %s" %
+                                 (rname, pkg, version))
+                    continue
+                signer_email = changer_email
+                logging.info("Used changes file to find contact email for %s %s %s" %
+                             (rname, pkg, version))
+            if 'buckets' in spph_buckets[rname][spph]:
+                # see if they've been emailed about the bucket before
+                notices = []
+                if signer_name in notifications:
+                    notices = notifications[signer_name]
+                for notice, notified_pkg, notified_version in notices:
+                    if notice in spph_buckets[rname][spph]['buckets']:
+                        if (notified_pkg != pkg and
+                                notified_version != version):
+                            continue
+                        spph_buckets[rname][spph]['buckets'].remove(notice)
+                if len(spph_buckets[rname][spph]['buckets']) == 0:
+                    continue
+                receivers = [bdmurray_mail]
+                quantity = len(spph_buckets[rname][spph]['buckets'])
+                msg = MIMEText(
+                    b_body % (pkg, version, rname, ('an ', '')[quantity != 1],
+                              ('', 's')[quantity != 1],
+                              ('was', 'were')[quantity != 1],
+                              ('', 's')[quantity != 1],
+                              ('s', '')[quantity != 1],
+                              '\n'.join(spph_buckets[rname][spph]['buckets']))
+                    + remedy)
+                subject = '[%s/%s] Possible Regression' % (rname, pkg)
+                msg['Subject'] = subject
+                msg['From'] = EMAIL_SENDER
+                msg['Reply-To'] = bdmurray_mail
+                receivers.append(signer_email)
+                msg['To'] = signer_email
+                if creator != signer and creator.is_valid:
+                    creator_email = get_primary_email(creator)
+                    # fall back to the email found in the changes file
+                    if not creator_email:
+                        creator_email = changer_email
+                    receivers.append(creator_email)
+                    msg['Cc'] = '%s' % changer_email
+                smtp = smtplib.SMTP('localhost')
+                smtp.sendmail(EMAIL_SENDER, receivers,
+                              msg.as_string())
+                smtp.quit()
+                logging.info('%s mailed about %s' % (receivers, subject))
+                # add signer, problem, pkg, version to notifications csv file
+                with codecs.open(NOTIFICATIONS, 'a', encoding='utf-8') as notify_file:
+                    for bucket in spph_buckets[rname][spph]['buckets']:
+                        notify_file.write('%s, %s, %s, %s\n' % \
+                                          (signer_name, bucket,
+                                           pkg, version))
+                        if changer_email:
+                            notify_file.write('%s, %s, %s, %s\n' % \
+                                              (creator.name, bucket,
+                                               pkg, version))
+            if 'rate' in spph_buckets[rname][spph]:
+                # see if they have been emailed about the increased rate
+                # for this package version before
+                notices = []
+                if signer_name in notifications:
+                    notices = notifications[signer_name]
+                if ('increased-rate', pkg, version) in notices:
+                    continue
+                receivers = [bdmurray_mail]
+                msg = MIMEText(i_body % (pkg, quote(version), rname,
+                                         spph_buckets[rname][spph]['rate'][1])
+                               + remedy)
+                subject = '[%s/%s] Increase in crash rate' % (rname, pkg)
+                msg['Subject'] = subject
+                msg['From'] = EMAIL_SENDER
+                msg['Reply-To'] = bdmurray_mail
+                receivers.append(signer_email)
+                msg['To'] = signer_email
+                if creator != signer and creator.is_valid:
+                    # fall back to the email found in the changes file
+                    if not creator_email:
+                        creator_email = changer_email
+                    receivers.append(creator_email)
+                    msg['Cc'] = '%s' % creator_email
+                smtp = smtplib.SMTP('localhost')
+                smtp.sendmail(EMAIL_SENDER, receivers,
+                              msg.as_string())
+                smtp.quit()
+                logging.info('%s mailed about %s' % (receivers, subject))
+                # add signer, increased-rate, pkg, version to
+                # notifications csv
+                with codecs.open(NOTIFICATIONS, 'a', encoding='utf-8') as notify_file:
+                    notify_file.write('%s, increased-rate, %s, %s\n' %
+                                      (signer_name, pkg, version))
+                    if creator_email:
+                        notify_file.write('%s, increased-rate, %s, %s\n' %
+                                          (creator.name, pkg, version))
+
+
+def new_buckets(archive, release, src_pkg, version):
+    # can't use created_since here because it have may been uploaded
+    # before the release date
+    spph = archive.getPublishedSources(distro_series=release,
+                                       source_name=src_pkg, exact_match=True)
+    pubs = [(ph.date_published, ph.source_package_version) for ph in spph
+            if ph.status != 'Deleted' and ph.pocket != 'Backports'
+            and ph.pocket != 'Proposed'
+            and ph.date_published is not None]
+    pubs = sorted(pubs)
+    # it is possible for the same version to appear multiple times
+    numbers = set([pub[1] for pub in pubs])
+    versions = sorted(numbers, cmp=apt.apt_pkg.version_compare)
+    # it never appeared in release e.g. cedarview-drm-drivers in precise
+    try:
+        previous_version = versions[-2]
+    except IndexError:
+        return False
+    new_version = versions[-1]
+    new_buckets_url = '%spackage-version-new-buckets/?format=json&' % \
+        (BASE_ERRORS_URL) + \
+        'package=%s&previous_version=%s&new_version=%s' % \
+        (quote(src_pkg), quote(previous_version), quote(new_version))
+    try:
+        new_buckets_file = urlopen(new_buckets_url)
+    except IOError:
+        return 'error'
+    # If we don't receive an OK response from the Error Tracker we should not
+    # increment the phased-update-percentage.
+    if new_buckets_file.getcode() != 200:
+        logging.error('HTTP error retrieving %s' % new_buckets_url)
+        return 'error'
+    try:
+        new_buckets_data = json.load(new_buckets_file)
+    except json.decoder.JSONDecodeError:
+        logging.error('Error getting new buckets at %s' % new_buckets_url)
+        return 'error'
+    if 'error_message' in new_buckets_data.keys():
+        logging.error('Error getting new buckets at %s' % new_buckets_url)
+        return 'error'
+    if len(new_buckets_data['objects']) == 0:
+        return False
+    buckets = []
+    for bucket in new_buckets_data['objects']:
+        # Do not consider package install failures until they have more
+        # information added to the instances.
+        if bucket['function'].startswith('package:'):
+            continue
+        # 16.04's duplicate signature for ProblemType: Package doesn't
+        # start with 'package:' so check for strings in the bucket.
+        if 'is already installed and configured' in bucket['function']:
+            logging.info('Skipped already installed bucket %s' %
+                         bucket['web_link'])
+            continue
+        # Skip failed buckets as they don't have useful tracebacks
+        if bucket['function'].startswith('failed:'):
+            logging.info('Skipped failed to retrace bucket %s' %
+                         bucket['web_link'])
+            continue
+        # check to see if the version appears for the affected release
+        versions_url = '%sversions/?format=json&id=%s' % \
+            ((BASE_ERRORS_URL) , quote(bucket['function'].encode('utf-8')))
+        try:
+            versions_data_file = urlopen(versions_url)
+        except IOError:
+            logging.error('Error getting release versions at %s' % versions_url)
+            # don't return an error because its better to have a false positive
+            # in this case
+            buckets.append(bucket['web_link'])
+            continue
+        try:
+            versions_data = json.load(versions_data_file)
+        except json.decoder.JSONDecodeError:
+            logging.error('Error getting release versions at %s' % versions_url)
+            # don't return an error because its better to have a false positive
+            # in this case
+            buckets.append(bucket['web_link'])
+            continue
+        if 'error_message' in versions_data:
+            # don't return an error because its better to have a false positive
+            # in this case
+            buckets.append(bucket['web_link'])
+            continue
+        # -1 means that release isn't affected
+        if len([vd[release.name] for vd in versions_data['objects'] \
+                if vd['version'] == new_version and vd[release.name] != -1]) == 0:
+            continue
+        buckets.append(bucket['web_link'])
+    logging.info('Details (new buckets): %s' % new_buckets_url)
+    return buckets
+
+
+def package_previous_version(release, src_pkg, version):
+    # return previous package version from updates or release and
+    # the publication date of the current package version
+    ubuntu = launchpad.distributions['ubuntu']
+    primary = ubuntu.getArchive(name='primary')
+    current_version_date = None
+    previous_version = None
+    # Archive.getPublishedSources returns results ordered by
+    # (name, id) where the id number is autocreated, subsequently
+    # the newest package versions are returned first
+    for spph in primary.getPublishedSources(source_name=src_pkg,
+                                            distro_series=release,
+                                            exact_match=True):
+        if spph.pocket == 'Proposed':
+            continue
+        if spph.status == 'Deleted':
+            continue
+        if spph.source_package_version == version:
+            if not current_version_date:
+                current_version_date = spph.date_published.date()
+            elif spph.date_published.date() > current_version_date:
+                current_version_date = spph.date_published.date()
+        if spph.pocket == 'Updates' and spph.status == 'Superseded':
+            return (spph.source_package_version, current_version_date)
+        if spph.pocket == 'Release' and spph.status == 'Published':
+            return (spph.source_package_version, current_version_date)
+    return (None, None)
+
+
+def crash_rate_increase(release, src_pkg, version, last_pup):
+    pvers, date = package_previous_version(release, src_pkg, version)
+    date = str(date).replace('-', '')
+    if not pvers:
+        # joyent-mdata-client was put in updates w/o being in the release
+        # pocket
+        return False
+    release_name = 'Ubuntu ' + release.version
+    rate_url = BASE_ERRORS_URL + 'package-rate-of-crashes/?format=json' + \
+        '&exclude_proposed=True' + \
+        '&release=%s&package=%s&old_version=%s&new_version=%s&phased_update_percentage=%s&date=%s' % \
+        (quote(release_name), quote(src_pkg), quote(pvers), quote(version),
+         last_pup, date)
+    try:
+        rate_file = urlopen(rate_url)
+    except IOError:
+        return 'error'
+    # If we don't receive an OK response from the Error Tracker we should not
+    # increment the phased-update-percentage.
+    if rate_file.getcode() != 200:
+        logging.error('HTTP error retrieving %s' % rate_url)
+        return 'error'
+    try:
+        rate_data = json.load(rate_file)
+    except json.decoder.JSONDecodeError:
+        logging.error('Error getting rate at %s' % rate_url)
+        return 'error'
+    if 'error_message' in rate_data.keys():
+        logging.error('Error getting rate at %s' % rate_url)
+        return 'error'
+    logging.info('Details (rate increase): %s' % rate_url)
+    # this may not be useful if the buckets creating the increase have
+    # failed to retrace
+    for data in rate_data['objects']:
+        if data['increase']:
+            previous_amount = data['previous_average']
+            # this may happen if there were no crashes reported about
+            # the previous version of the package
+            if not previous_amount:
+                logging.info('No previous crash data found for %s %s' %
+                             (src_pkg, pvers))
+                previous_amount = 0
+            if 'difference' in data:
+                increase = data['difference']
+            elif 'this_count' in data:
+            # 2013-06-17 this can be negative due to the portion of the
+            # day math (we take the average crashes and multiple them by
+            # the fraction of hours that have passed so far in the day)
+                current_amount = data['this_count']
+                increase = current_amount - previous_amount
+            logging.info('[%s/%s] increase: %s, previous_avg: %s' %
+                         (release_name.replace('Ubuntu ', ''), src_pkg,
+                          increase, previous_amount))
+            if '&version=' not in data['web_link']:
+                link = data['web_link'] + '&version=%s' % version
+            else:
+                link = data['web_link']
+            logging.info('Details (rate increase): %s' % link)
+            return(increase, link)
+
+
+def main():
+    #  TODO: make email code less redundant
+    #  TODO: modify HTTP_USER_AGENT (both versions of urllib)
+    #  TODO: Open bugs for regressions when false positives reduced
+    ubuntu = launchpad.distributions['ubuntu']
+    archive = ubuntu.getArchive(name='primary')
+    options.archive = archive
+
+    overrides = defaultdict(list)
+    rate_overrides = []
+    override_file = csv.reader(open(OVERRIDES, 'r'))
+    for row in override_file:
+        if len(row) < 3:
+            continue
+        # package, version, problem
+        if row[0].startswith('#'):
+            continue
+        package = row[0].strip()
+        version = row[1].strip()
+        problem = row[2].strip()
+        if problem == 'increased-rate':
+            rate_overrides.append((package, version))
+        else:
+            overrides[(package, version)].append(problem)
+
+    releases = []
+    for series in ubuntu.series:
+        if series.active:
+            if series.status == 'Active Development':
+                continue
+            releases.append(series)
+    releases.reverse()
+    issues = {}
+    for release in releases:
+        # We can't use release.datereleased because some SRUs are 0 day
+        cdate = release.date_created
+        rname = release.name
+        rvers = release.version
+        issues[rname] = OrderedDict()
+        # XXX - starting with raring
+        if rname in ['precise', 'vivid']:
+            continue
+        pub_sources = archive.getPublishedSources(
+            created_since_date=cdate,
+            order_by_date=True,
+            pocket='Updates', status='Published', distro_series=release)
+        for pub_source in pub_sources:
+            src_pkg = pub_source.source_package_name
+            version = pub_source.source_package_version
+            pbs = None
+            try:
+                pbs = [pb for pb in pub_source.getPublishedBinaries()
+                       if pb.phased_update_percentage is not None]
+            # workaround for LP: #1695113
+            except lazr.restfulclient.errors.ServerError as e:
+                if 'HTTP Error 503' in str(e):
+                    logging.info('Skipping 503 Error for %s' % src_pkg)
+                    pass
+            if not pbs:
+                continue
+            if pbs:
+                # the p-u-p is currently the same for all binary packages
+                last_pup = pbs[0].phased_update_percentage
+            else:
+                last_pup = None
+            max_pup = 0
+            if last_pup == 0:
+                    for allpb in archive.getPublishedBinaries(
+                            exact_match=True, pocket='Updates',
+                            binary_name=pbs[0].binary_package_name):
+                        if allpb.distro_arch_series.distroseries == release:
+                            if allpb.phased_update_percentage > 0:
+                                max_pup = allpb.phased_update_percentage
+                                break
+            if max_pup and last_pup == 0:
+                rate_increase = crash_rate_increase(release, src_pkg, version, max_pup)
+            else:
+                rate_increase = crash_rate_increase(release, src_pkg, version, last_pup)
+            problems = new_buckets(archive, release, src_pkg, version)
+            # In the event that there as an error connecting to errors.ubuntu.com then
+            # neither increase nor stop the phased-update.
+            if rate_increase == 'error' or problems == 'error':
+                logging.info("Skipping %s due to failure to get data from Errors." % src_pkg)
+                continue
+            if problems:
+                if (src_pkg, version) in overrides:
+                    not_overrode = set(problems).difference(
+                        set(overrides[(src_pkg, version)]))
+                    if len(not_overrode) > 0:
+                        issues[rname][pub_source] = {}
+                        issues[rname][pub_source]['buckets'] = not_overrode
+                else:
+                    issues[rname][pub_source] = {}
+                    issues[rname][pub_source]['buckets'] = problems
+            if rate_increase and (src_pkg, version) not in rate_overrides:
+                if pub_source not in issues[rname]:
+                    issues[rname][pub_source] = {}
+                issues[rname][pub_source]['rate'] = rate_increase
+            if pbs:
+                if pub_source not in issues[rname]:
+                    issues[rname][pub_source] = {}
+                # phasing has stopped so check what the max value was
+                if last_pup == 0:
+                    issues[rname][pub_source]['max_pup'] = max_pup
+                issues[rname][pub_source]['pup'] = last_pup
+            suite = rname + '-updates'
+            if pub_source not in issues[rname]:
+                continue
+            elif ('rate' not in issues[rname][pub_source] and
+                  'buckets' not in issues[rname][pub_source] and
+                  pbs):
+                # there is not an error so increment the phasing
+                current_pup = issues[rname][pub_source]['pup']
+                # if this is an update that is restarting we want to start at
+                # the same percentage the stoppage happened at
+                if 'max_pup' in issues[rname][pub_source]:
+                    current_pup = issues[rname][pub_source]['max_pup']
+                new_pup = current_pup + PUP_INCREMENT
+                if not options.no_act:
+                    set_pup(current_pup, new_pup, release, suite, src_pkg)
+                issues[rname][pub_source]['pup'] = new_pup
+            elif pbs:
+                # there is an error and pup is not None so stop the phasing
+                current_pup = issues[rname][pub_source]['pup']
+                if 'max_pup' in issues[rname][pub_source]:
+                    issues[rname][pub_source]['previous_pup'] = \
+                        issues[rname][pub_source]['max_pup']
+                else:
+                    issues[rname][pub_source]['previous_pup'] = \
+                        current_pup
+                new_pup = 0
+                if (not options.no_act and
+                        issues[rname][pub_source]['pup'] != 0):
+                    set_pup(current_pup, new_pup, release, suite, src_pkg)
+                issues[rname][pub_source]['pup'] = new_pup
+    generate_html_report(releases, issues)
+    if options.email:
+        create_email_notifications(releases, issues)
+
+if __name__ == '__main__':
+    start_time = time.time()
+    BASE_ERRORS_URL = 'https://errors.ubuntu.com/api/1.0/'
+    LOCAL_ERRORS_URL = 'http://10.0.3.182/api/1.0/'
+    LP_BASE_URL = 'https://launchpad.net'
+    OVERRIDES = 'phased-updates-overrides.txt'
+    NOTIFICATIONS = 'phased-updates-emails.txt'
+    EMAIL_SENDER = 'brian.murray@ubuntu.com'
+    PUP_INCREMENT = 10
+    REPORT_FILE = 'phased-updates.html'
+    parser = OptionParser(usage="usage: %prog [options]")
+    parser.add_option(
+        "-l", "--launchpad", dest="launchpad_instance", default="production")
+    parser.add_option(
+        "-n", "--no-act", default=False, action="store_true",
+        help="do not modify phased update percentages")
+    parser.add_option(
+        "-e", "--email", default=False, action="store_true",
+        help="send email notifications to uploaders")
+    parser.add_option(
+        "-f", "--fully-phased", default=False, action="store_true",
+        help="show packages which have been fully phased")
+    options, args = parser.parse_args()
+    if options.launchpad_instance != 'production':
+        LP_BASE_URL = 'https://%s.launchpad.net' % options.launchpad_instance
+    launchpad = Launchpad.login_with(
+        'phased-updater', options.launchpad_instance, version='devel')
+    logging.basicConfig(filename='phased-updates.log',
+                        format='%(asctime)s - %(levelname)s - %(message)s',
+                        level=logging.INFO)
+    logging.info('Starting phased-updater')
+    main()
+    end_time = time.time()
+    logging.info("Elapsed time was %g seconds" % (end_time - start_time))

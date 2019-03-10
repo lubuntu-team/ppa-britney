@@ -1,0 +1,175 @@
+#! /usr/bin/python
+
+# Copyright (C) 2012  Canonical Ltd.
+# Author: Colin Watson <cjwatson@ubuntu.com>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+"""Branch a set of Ubuntu seeds for the next release."""
+
+from __future__ import print_function
+
+from optparse import OptionParser
+import os
+import re
+import subprocess
+try:
+    from urllib.parse import urlparse
+except ImportError:
+    from urlparse import urlparse
+
+from launchpadlib.launchpad import Launchpad
+from enum import Enum
+
+class VCS(Enum):
+    Git = 1
+    Bazaar = 2
+
+    @staticmethod
+    def detect_vcs(source):
+        if os.path.exists(os.path.join(source, ".git")):
+            return VCS.Git
+        elif os.path.exists(os.path.join(source, ".bzr")):
+            return VCS.Bazaar
+        else:
+            return None
+
+
+def remote_bzr_branch(source):
+    # TODO: should really use bzrlib instead
+    info = subprocess.check_output(
+        ["bzr", "info", source], universal_newlines=True)
+    for line in info.splitlines():
+        if "checkout of branch:" in line:
+            return line.split(": ")[1].rstrip("/")
+    else:
+        raise Exception("Unable to find remote branch for %s" % source)
+
+
+def remote_git_repository(source, srcbranch):
+    fullbranch = subprocess.check_output(
+        ["git", "rev-parse", "--symbolic-full-name",
+         srcbranch + "@{upstream}"],
+        universal_newlines=True, cwd=source)
+    return subprocess.check_output(
+        ["git", "ls-remote", "--get-url", fullbranch.split("/")[2]],
+        universal_newlines=True, cwd=source).rstrip("\n")
+
+
+def lp_branch(options, url):
+    return options.launchpad.branches.getByUniqueName(
+        unique_name=urlparse(url).path.lstrip("/"))
+
+
+def branch(options, collection):
+    source = "%s.%s" % (collection, options.source_series)
+    dest = "%s.%s" % (collection, options.dest_series)
+    vcs = VCS.detect_vcs(source)
+    if vcs:
+        if vcs is VCS.Bazaar:
+            subprocess.check_call(["bzr", "up", source])
+            remote_source = remote_bzr_branch(source)
+            remote_dest = os.path.join(os.path.dirname(remote_source), dest)
+            subprocess.check_call(["bzr", "branch", source, dest])
+            subprocess.check_call(["bzr", "push", "-d", dest, remote_dest])
+            subprocess.check_call(["bzr", "bind", ":push"], cwd=dest)
+
+            lp_source = lp_branch(options, remote_source)
+            lp_source.lifecycle_status = "Mature"
+            lp_source.lp_save()
+
+            lp_dest = lp_branch(options, remote_dest)
+            lp_dest.lifecycle_status = "Development"
+            lp_dest.lp_save()
+        elif vcs is VCS.Git:
+            subprocess.check_call(["git", "fetch"], cwd=source)
+            subprocess.check_call(["git", "reset", "--hard", "FETCH_HEAD"], cwd=source)
+            os.rename(source, dest)
+            subprocess.check_call(["git", "checkout", "-b", options.dest_series], cwd=dest)
+
+        re_include_source = re.compile(
+            r"^(include )(.*)\.%s" % options.source_series)
+        new_lines = []
+        message = []
+        with open(os.path.join(dest, "STRUCTURE")) as structure:
+            for line in structure:
+                match = re_include_source.match(line)
+                if match:
+                    new_lines.append(re_include_source.sub(
+                        r"\1\2.%s" % options.dest_series, line))
+                    message.append(
+                        "%s.%s -> %s.%s" %
+                        (match.group(2), options.source_series,
+                         match.group(2), options.dest_series))
+                else:
+                    new_lines.append(line)
+        if message:
+            with open(os.path.join(dest, "STRUCTURE.new"), "w") as structure:
+                for line in new_lines:
+                    print(line, end="", file=structure)
+            os.rename(
+                os.path.join(dest, "STRUCTURE.new"),
+                os.path.join(dest, "STRUCTURE"))
+            if vcs is VCS.Bazaar:
+                subprocess.check_call(
+                    ["bzr", "commit", "-m", "; ".join(message)], cwd=dest)
+            elif vcs is VCS.Git:
+                subprocess.check_call(["git", "add", "STRUCTURE"], cwd=dest)
+                subprocess.check_call(
+                    ["git", "commit", "-m", "; ".join(message)], cwd=dest)
+                subprocess.check_call(
+                    ["git", "push", "origin", options.dest_series], cwd=dest)
+
+                remote = remote_git_repository(dest, options.source_series)
+                if "git.launchpad.net" in remote:
+                    lp_git_repo = options.launchpad.git_repositories.getByPath(
+                        path=urlparse(remote).path.lstrip("/"))
+                    lp_git_repo.default_branch = options.dest_series
+                    lp_git_repo.lp_save()
+                else:
+                    raise Exception(
+                        "Git remote URL must be on git.launchpad.net.")
+
+
+def main():
+    parser = OptionParser(usage="usage: %prog [options] collection ...")
+    parser.add_option(
+        "-l", "--launchpad", dest="launchpad_instance", default="production")
+    parser.add_option(
+        "--source-series",
+        help="source series (default: current stable release)")
+    parser.add_option(
+        "--dest-series",
+        help="destination series (default: series in pre-release freeze)")
+    options, args = parser.parse_args()
+    if not args:
+        parser.error("You must specify at least one seed collection.")
+
+    options.launchpad = Launchpad.login_with(
+        "branch-seeds", options.launchpad_instance, version="devel")
+
+    distro = options.launchpad.distributions["ubuntu"]
+    if options.source_series is None:
+        options.source_series = [
+            series.name for series in distro.series
+            if series.status == "Current Stable Release"][0]
+    if options.dest_series is None:
+        options.dest_series = [
+            series.name for series in distro.series
+            if series.status == "Pre-release Freeze"][0]
+
+    for collection in args:
+        branch(options, collection)
+
+
+main()

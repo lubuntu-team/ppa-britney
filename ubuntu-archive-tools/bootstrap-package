@@ -1,0 +1,93 @@
+#! /usr/bin/python
+
+# Copyright (C) 2016  Canonical Ltd.
+# Author: Colin Watson <cjwatson@ubuntu.com>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+"""Bootstrap a package build using injected build-dependencies."""
+
+from __future__ import print_function
+import sys
+
+from optparse import (
+    OptionParser,
+    SUPPRESS_HELP,
+    )
+
+from launchpadlib.launchpad import Launchpad
+
+import lputils
+
+
+def bootstrap_package(options, package):
+    source = lputils.find_latest_published_source(options, package)
+    arch_tags = [a.architecture_tag for a in options.architectures]
+    for build in source.getBuilds():
+        if build.arch_tag in arch_tags:
+            if (build.buildstate != "Needs building" and
+                    not build.can_be_retried):
+                print("%s cannot be retried" % build.web_link, file=sys.stderr)
+            elif options.dry_run:
+                print("Would bootstrap %s" % build.web_link)
+            else:
+                print("Bootstrapping %s" % build.web_link)
+                build.external_dependencies = (
+                    "deb [trusted=yes] "
+                    "http://archive-team.internal/bootstrap/%s %s main" %
+                    (build.arch_tag, source.distro_series.name))
+                build.lp_save()
+                build.retry()
+
+
+def bootstrap_packages(options, packages):
+    for package in packages:
+        bootstrap_package(options, package)
+
+
+def main():
+    parser = OptionParser(
+        usage="usage: %prog [options] package [...]",
+        epilog=lputils.ARCHIVE_REFERENCE_DESCRIPTION)
+    parser.add_option(
+        "-l", "--launchpad", dest="launchpad_instance", default="production")
+    parser.add_option(
+        "-n", "--dry-run", default=False, action="store_true",
+        help="only show what would be done")
+    parser.add_option("-A", "--archive", help="bootstrap in ARCHIVE")
+    parser.add_option(
+        "-s", "--suite", metavar="SUITE", help="bootstrap in SUITE")
+    parser.add_option(
+        "-a", "--architecture", dest="architectures", action="append",
+        metavar="ARCHITECTURE",
+        help="architecture tag (may be given multiple times)")
+    parser.add_option(
+        "-d", "--distribution", default="ubuntu", help=SUPPRESS_HELP)
+    parser.add_option(
+        "-e", "--version",
+        metavar="VERSION", help="package version (default: current version)")
+
+    options, args = parser.parse_args()
+
+    options.launchpad = Launchpad.login_with(
+        "bootstrap-package", options.launchpad_instance, version="devel")
+    lputils.setup_location(options, default_pocket="Proposed")
+
+    if not args:
+        parser.error("You must specify some packages to bootstrap.")
+
+    bootstrap_packages(options, args)
+
+
+if __name__ == "__main__":
+    main()

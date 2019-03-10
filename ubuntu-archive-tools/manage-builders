@@ -1,0 +1,325 @@
+#!/usr/bin/python
+# Manage the Launchpad build farm.
+#
+# Copyright 2012-2014 Canonical Ltd.
+# Author: William Grant <wgrant@ubuntu.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+from __future__ import print_function
+
+import argparse
+from datetime import (
+    datetime,
+    timedelta,
+    )
+from itertools import groupby
+import re
+from textwrap import dedent
+
+from launchpadlib.launchpad import Launchpad
+from lazr.restfulclient.errors import PreconditionFailed
+import pytz
+
+
+def format_timedelta(delta):
+    value = None
+    hours = delta.seconds // 3600
+    minutes = (delta.seconds - (hours * 3600)) // 60
+    if delta.days > 0:
+        value = delta.days
+        unit = 'day'
+    elif hours > 0:
+        value = hours
+        unit = 'hour'
+    elif minutes > 0:
+        value = minutes
+        unit = 'minute'
+    if value is not None:
+        return 'for %d %s%s' % (value, unit, 's' if value > 1 else '')
+    return ''
+
+
+parser = argparse.ArgumentParser(description=dedent("""\
+    List and manage Launchpad builders.
+
+    If no changes are specified (--auto, --manual, --enable, --disable,
+    --set-failnotes, --set-virtual, --set-non-virtual, or --set-vm-host), a
+    detailed listing of matching builders will be shown.
+    """))
+parser.add_argument(
+    "-l", "--lp-instance", dest="lp_instance", default="production",
+    help="use the specified Launchpad instance (default: production)")
+
+parser.add_argument(
+    "-q", "--quiet", dest="quiet", action="store_true", default=None,
+    help="only display errors")
+parser.add_argument(
+    "-v", "--verbose", dest="verbose", action="store_true", default=None,
+    help="display more detail")
+
+parser.add_argument(
+    "-a", "--arch", dest="arch", default=None,
+    help="update only builders of this architecture (eg. i386)")
+parser.add_argument(
+    "-b", "--builder", dest="builders", action="append", metavar="BUILDER",
+    help="update only this builder (may be given multiple times)")
+parser.add_argument(
+    "--failnotes", dest="failnotes", default=None,
+    help="update only builders with failnotes matching this regexp")
+parser.add_argument(
+    "-e", "--enabled", action="store_const", dest="ok_filter", const=True,
+    help="update only enabled builders")
+parser.add_argument(
+    "-d", "--disabled", action="store_const", dest="ok_filter", const=False,
+    help="update only disabled builders")
+parser.add_argument(
+    "--cleaning", action="store_const", dest="cleaning_filter", const=True,
+    help="update only builders that are stuck cleaning")
+parser.add_argument(
+    "--virtual", action="store_const", dest="virtual_filter", const=True,
+    help="update only virtual builders")
+parser.add_argument(
+    "--non-virtual", action="store_const", dest="virtual_filter", const=False,
+    help="update only non-virtual builders")
+parser.add_argument(
+    "--builder-version", dest="builder_version", default=None,
+    help="update only builders running this launchpad-buildd version")
+
+dispatch_group = parser.add_mutually_exclusive_group()
+dispatch_group.add_argument(
+    "--auto", dest="auto", action="store_true", default=None,
+    help="enable automatic dispatching")
+dispatch_group.add_argument(
+    "--manual", dest="manual", action="store_true", default=None,
+    help="disable automatic dispatching")
+ok_group = parser.add_mutually_exclusive_group()
+ok_group.add_argument(
+    "--enable", dest="enable", action="store_true", default=None,
+    help="mark the builder as OK")
+ok_group.add_argument(
+    "--disable", dest="disable", action="store_true", default=None,
+    help="mark the builder as not OK")
+ok_group.add_argument(
+    "--reset", dest="reset", action="store_true", default=None,
+    help="reset the builder by disabling and re-enabling it")
+parser.add_argument(
+    "--set-failnotes", dest="set_failnotes", default=None,
+    help="set the builder's failnotes")
+virtual_group = parser.add_mutually_exclusive_group()
+virtual_group.add_argument(
+    "--set-virtual", dest="set_virtual", action="store_true", default=None,
+    help="mark the builder as virtual")
+virtual_group.add_argument(
+    "--set-non-virtual", dest="set_non_virtual",
+    action="store_true", default=None,
+    help="mark the builder as non-virtual")
+visible_group = parser.add_mutually_exclusive_group()
+visible_group.add_argument(
+    "--set-visible", dest="set_visible", action="store_true", default=None,
+    help="mark the builder as visible")
+visible_group.add_argument(
+    "--set-invisible", dest="set_invisible", action="store_true", default=None,
+    help="mark the builder as invisible")
+parser.add_argument(
+    "--set-vm-host", dest="set_vm_host", default=None,
+    help="set the builder's VM host")
+
+args = parser.parse_args()
+
+changes = {}
+if args.manual:
+    changes['manual'] = True
+if args.auto:
+    changes['manual'] = False
+if args.enable:
+    changes['builderok'] = True
+if args.disable or args.reset:
+    # In the --reset case, we'll re-enable it manually after applying this.
+    changes['builderok'] = False
+if args.set_failnotes is not None:
+    changes['failnotes'] = args.set_failnotes or None
+if args.set_virtual:
+    changes['virtualized'] = True
+if args.set_non_virtual:
+    changes['virtualized'] = False
+if args.set_visible:
+    changes['active'] = True
+if args.set_invisible:
+    changes['active'] = False
+if args.set_vm_host is not None:
+    changes['vm_host'] = args.set_vm_host or None
+
+lp = Launchpad.login_with(
+    'manage-builders', args.lp_instance, version='devel')
+
+processor_names = {p.self_link: p.name for p in lp.processors}
+
+def get_processor_name(processor_link):
+    if processor_link not in processor_names:
+        processor_names[processor_link] = lp.load(processor_link).name
+    return processor_names[processor_link]
+
+def get_clean_status_duration(builder):
+    return datetime.now(pytz.UTC) - builder.date_clean_status_changed
+
+def is_cleaning(builder):
+    return (
+        builder.builderok
+        and builder.current_build_link is None
+        and builder.clean_status in ('Dirty', 'Cleaning')
+        and get_clean_status_duration(builder) > timedelta(minutes=10))
+
+candidates = []
+for builder in lp.builders:
+    if not builder.active:
+        continue
+    if args.ok_filter is not None and builder.builderok != args.ok_filter:
+        continue
+    if (args.cleaning_filter is not None
+            and is_cleaning(builder) != args.cleaning_filter):
+        continue
+    if (args.virtual_filter is not None
+            and builder.virtualized != args.virtual_filter):
+        continue
+    if args.builders and builder.name not in args.builders:
+        continue
+    if (args.arch
+        and not any(get_processor_name(p) == args.arch
+                    for p in builder.processors)):
+        continue
+    if (args.failnotes and (
+            not builder.failnotes
+            or not re.search(args.failnotes, builder.failnotes))):
+        continue
+    if (args.builder_version is not None and
+            args.builder_version != builder.version):
+        continue
+    candidates.append(builder)
+
+def builder_sort_key(builder):
+    return (
+        not builder.virtualized,
+        # https://launchpad.net/builders sorts by Processor.id, but that
+        # isn't accessible on the webservice.  This produces vaguely similar
+        # results in practice and looks reasonable.
+        sorted(builder.processors),
+        builder.vm_host,
+        builder.vm_reset_protocol if builder.virtualized else '',
+        builder.name)
+
+def apply_changes(obj, **changes):
+    count = 3
+    for i in range(count):
+        changed = False
+        for change, value in changes.items():
+            if getattr(obj, change) != value:
+                setattr(obj, change, value)
+                changed = True
+        if changed:
+            try:
+                obj.lp_save()
+                break
+            except PreconditionFailed:
+                if i == count - 1:
+                    raise
+                obj.lp_refresh()
+    return changed
+
+candidates.sort(key=builder_sort_key)
+
+count_changed = count_unchanged = 0
+
+if changes and not args.quiet:
+    print('Updating %d builders.' % len(candidates))
+
+if args.verbose:
+    clump_sort_key = lambda b: builder_sort_key(b)[:4]
+else:
+    clump_sort_key = lambda b: builder_sort_key(b)[:2]
+builder_clumps = [
+    list(group) for _, group in groupby(candidates, clump_sort_key)]
+
+for clump in builder_clumps:
+    if not changes and not args.quiet:
+        if clump != builder_clumps[0]:
+            print()
+        exemplar = clump[0]
+        archs = ' '.join(get_processor_name(p) for p in exemplar.processors)
+        if args.verbose:
+            if exemplar.virtualized:
+                virt_desc = '(v %s)' % exemplar.vm_reset_protocol
+            else:
+                virt_desc = '(nv)'
+            print(
+                '%s %s%s' % (
+                    virt_desc, archs,
+                    (' [%s]' % exemplar.vm_host) if exemplar.vm_host else ''))
+        else:
+            print(
+                '%-4s %s' % ('(v)' if exemplar.virtualized else '(nv)', archs))
+
+    for candidate in clump:
+        changed = apply_changes(candidate, **changes)
+        if args.reset and not candidate.builderok:
+            if apply_changes(candidate, builderok=True):
+                changed = True
+        if changed:
+            count_changed += 1
+            if not args.quiet:
+                print('* %s' % candidate.name)
+        elif changes:
+            if not args.quiet:
+                print('  %s' % candidate.name)
+            count_unchanged += 1
+        else:
+            duration = get_clean_status_duration(candidate)
+            if not candidate.builderok:
+                # Disabled builders always need explanation.
+                if candidate.failnotes:
+                    failnote = candidate.failnotes.strip().splitlines()[0]
+                else:
+                    failnote = 'no failnotes'
+                status = 'DISABLED: %s' % failnote
+            elif is_cleaning(candidate):
+                # Idle builders that have been dirty or cleaning for more
+                # than ten minutes are a little suspicious.
+                status = '%s %s' % (
+                    candidate.clean_status, format_timedelta(duration))
+            elif (candidate.current_build_link is not None
+                  and duration > timedelta(days=1)):
+                # Something building for more than a day deserves
+                # investigation.
+                status = 'Building %s' % format_timedelta(duration)
+            else:
+                status = ''
+            if args.verbose:
+                if candidate.current_build_link is not None:
+                    dirty_flag = 'B'
+                elif candidate.clean_status == 'Dirty':
+                    dirty_flag = 'D'
+                elif candidate.clean_status == 'Cleaning':
+                    dirty_flag = 'C'
+                else:
+                    dirty_flag = ' '
+                print(
+                    '  %-18s %-8s %s%s%s  %s' % (
+                        candidate.name, candidate.version,
+                        dirty_flag, 'M' if candidate.manual else ' ',
+                        'X' if not candidate.builderok else ' ',
+                        status))
+            elif not args.quiet:
+                print('  %-20s %s' % (candidate.name, status))
+
+if changes and not args.quiet:
+    print("Changed: %d. Unchanged: %d." % (count_changed, count_unchanged))

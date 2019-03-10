@@ -1,0 +1,47 @@
+#!/bin/sh
+set -e
+
+# Copyright (C) 2009, 2010, 2011  Canonical Ltd.
+# Author: Martin Pitt <martin.pitt@canonical.com>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+# Run archive-cruft-check and run checkrdepends on every NBS package.
+
+MIRROR=$HOME/mirror
+DISTRIBUTION="${DISTRIBUTION:-ubuntu}"
+RELEASE="${RELEASE:-disco}"
+OUTDIR="${OUTDIR:-$HOME/public_html/NBS}"
+OUTFILE="${OUTFILE:-$HOME/public_html/nbs.html}"
+
+CURBINS=`zgrep -h ^Binary: "$MIRROR/$DISTRIBUTION/dists/$RELEASE"/*/source/Sources.gz | cut -f 2- -d\ |sed 's/,[[:space:]]*/\n/g'`
+
+D=`mktemp -d`
+trap "rm -rf $D" 0 2 3 5 10 13 15
+chmod 755 $D
+
+CHECK=
+for i in $(archive-cruft-check -d "$DISTRIBUTION" -s "$RELEASE" "$MIRROR" 2>&1 | grep '^ *o ' | sed 's/^.*://; s/,//g'); do
+    if echo "$CURBINS" | fgrep -xq $i; then
+        echo "$i" >> $D/00FTBFS
+    else
+        CHECK="$CHECK $i"
+    fi
+done
+checkrdepends -B "$MIRROR/$DISTRIBUTION" -s $RELEASE -b -d "$D" $CHECK
+
+rsync -a --delete "$D/" "$OUTDIR/"
+
+nbs-report -d "$DISTRIBUTION" -s "$RELEASE" --csv "${OUTFILE%.html}.csv" \
+    "$OUTDIR/" >"$OUTFILE.new" && \
+    mv "$OUTFILE.new" "$OUTFILE"

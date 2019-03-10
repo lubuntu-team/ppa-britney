@@ -1,0 +1,86 @@
+#! /usr/bin/python
+
+# Copyright (C) 2012  Canonical Ltd.
+# Author: Colin Watson <cjwatson@ubuntu.com>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+"""Branch a set of live filesystem configurations for the next release."""
+
+from __future__ import print_function
+
+from optparse import OptionParser
+
+from launchpadlib.launchpad import Launchpad
+
+
+def branch_livefses(options, owner):
+    for livefs in list(options.launchpad.livefses):
+        if (livefs.owner == owner and
+                livefs.distro_series == options.source_series):
+            print("Branching %s for %s ..." % (
+                livefs.web_link, options.dest_series.name))
+            new_livefs = options.launchpad.livefses.new(
+                owner=owner, distro_series=options.dest_series,
+                name=livefs.name, metadata=livefs.metadata)
+            new_livefs.require_virtualized = livefs.require_virtualized
+            new_livefs.relative_build_score = livefs.relative_build_score
+            new_livefs.lp_save()
+            print("  %s" % new_livefs.web_link)
+
+
+def main():
+    parser = OptionParser(usage="usage: %prog [options] OWNER")
+    parser.add_option(
+        "-l", "--launchpad", dest="launchpad_instance", default="production")
+    parser.add_option(
+        "-d", "--distribution", default="ubuntu", metavar="DISTRIBUTION",
+        help="branch live filesystems for DISTRIBUTION")
+    parser.add_option(
+        "--source-series",
+        help="source series (default: current stable release)")
+    parser.add_option(
+        "--dest-series",
+        help="destination series (default: series in pre-release freeze)")
+    options, args = parser.parse_args()
+    if not args:
+        parser.error(
+            "You must specify an owner whose live filesystems you want to "
+            "copy.")
+
+    options.launchpad = Launchpad.login_with(
+        "branch-livefses", options.launchpad_instance, version="devel")
+
+    distro = options.launchpad.distributions[options.distribution]
+    if options.source_series is None:
+        options.source_series = [
+            series for series in distro.series
+            if series.status == "Current Stable Release"][0]
+    else:
+        options.source_series = distro.getSeries(
+            name_or_version=options.source_series)
+    if options.dest_series is None:
+        options.dest_series = [
+            series for series in distro.series
+            if series.status == "Pre-release Freeze"][0]
+    else:
+        options.dest_series = distro.getSeries(
+            name_or_version=options.dest_series)
+
+    owner = options.launchpad.people[args[0]]
+
+    branch_livefses(options, owner)
+
+
+if __name__ == '__main__':
+    main()

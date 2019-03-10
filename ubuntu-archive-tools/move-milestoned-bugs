@@ -1,0 +1,85 @@
+#!/usr/bin/python
+
+# Copyright (C) 2011, 2012  Canonical Ltd.
+# Author: Martin Pitt <martin.pitt@ubuntu.com>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+# Move all bugs of a milestone to another milestone. This is usually done after
+# the milestone was released.
+
+import optparse
+import sys
+
+from launchpadlib.launchpad import Launchpad
+
+
+def parse_args():
+    '''Parse command line.
+
+    Return (options, arguments).
+    '''
+    parser = optparse.OptionParser(
+        usage='Usage: %prog [options] <from milestone> <to milestone>')
+    parser.add_option(
+        "-l", "--launchpad", dest="launchpad_instance", default="production")
+    parser.add_option(
+        "-s", "--series",
+        help="Ubuntu release to work on (default: current development "
+             "release)")
+    parser.add_option(
+        "-n", "--no-act", "--dry-run", action="store_true",
+        help="Only show bugs that would be moved, but do not act on them")
+    options, args = parser.parse_args()
+
+    if len(args) != 2:
+        parser.error('Need to specify "from" and "to" milestone. See --help')
+
+    return (options, args)
+
+if __name__ == '__main__':
+    (options, (from_ms, to_ms)) = parse_args()
+
+    launchpad = Launchpad.login_with(
+        'ubuntu-archive-tools', options.launchpad_instance)
+    ubuntu = launchpad.distributions['ubuntu']
+    if options.series:
+        distro_series = ubuntu.getSeries(name_or_version=options.series)
+    else:
+        distro_series = ubuntu.current_series
+
+    # convert milestone names to LP objects
+    lp_milestones = {}
+    for m in distro_series.all_milestones:
+        lp_milestones[m.name] = m
+    try:
+        from_ms = lp_milestones[from_ms]
+    except KeyError:
+        sys.stderr.write('ERROR: Unknown milestone %s\n' % from_ms)
+        sys.exit(1)
+    try:
+        to_ms = lp_milestones[to_ms]
+    except KeyError:
+        sys.stderr.write('ERROR: Unknown milestone %s\n' % to_ms)
+        sys.exit(1)
+
+    # move them over
+    if options.no_act:
+        print('Would move the following bug tasks to %s:' % to_ms.name)
+    else:
+        print('Moving the following bug tasks to %s:' % to_ms.name)
+    for task in from_ms.searchTasks():
+        print(task.title)
+        if not options.no_act:
+            task.milestone_link = to_ms
+            task.lp_save()

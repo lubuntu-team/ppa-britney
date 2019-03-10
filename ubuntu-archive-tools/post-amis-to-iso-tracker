@@ -1,0 +1,132 @@
+#! /usr/bin/python
+
+# Copyright (C) 2010, 2011, 2012  Canonical Ltd.
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+from __future__ import print_function
+
+import argparse
+import os
+import sys
+
+# See isotracker.py for setup instructions.
+from isotracker import ISOTracker
+
+# USAGE:  post-amis-to-iso-tracker /<localpath>/published-ec2-daily.txt
+#         it will return silently if successful.  Check by looking at:
+#         http://iso.qa.ubuntu.com/qatracker/build/all
+#
+# URLs to wget locally first are of the form:
+#  http://uec-images.ubuntu.com/server/natty/20110302.2/published-ec2-daily.txt
+#
+# See isotracker.py for setup instructions.
+#
+# Reminder 2011/03/02 - check with jibel what's happening in the iso.tracker
+# right now, and if this is still necessary.
+# Also,  why are the paths for downloading the images from the isotracker not
+# synching up with what was in the published-ec2-daily.txt.
+# 2011/03/29 - added in ap-northeast images
+
+ec2_to_product_map = {
+    'eu-west-1-amd64-ebs': 'Ubuntu Server EC2 EBS (Europe) amd64',
+    'eu-west-1-i386-ebs': 'Ubuntu Server EC2 EBS (Europe) i386',
+    'eu-west-1-amd64-hvm': 'Ubuntu Server EC2 HVM (Europe) amd64',
+    'us-east-1-amd64-ebs': 'Ubuntu Server EC2 EBS (US-East) amd64',
+    'us-east-1-i386-ebs': 'Ubuntu Server EC2 EBS (US-East) i386',
+    'us-west-1-amd64-ebs': 'Ubuntu Server EC2 EBS (US-West-1) amd64',
+    'us-west-1-i386-ebs': 'Ubuntu Server EC2 EBS (US-West-1) i386',
+    'us-west-2-amd64-ebs': 'Ubuntu Server EC2 EBS (US-West-2) amd64',
+    'us-west-2-i386-ebs': 'Ubuntu Server EC2 EBS (US-West-2) i386',
+    'us-west-2-amd64-hvm': 'Ubuntu Server EC2 HVM (US-West-2) amd64',
+    'us-east-1-amd64-hvm': 'Ubuntu Server EC2 HVM (US-East) amd64',
+    'eu-west-1-amd64-instance': 'Ubuntu Server EC2 instance (Europe) amd64',
+    'eu-west-1-i386-instance': 'Ubuntu Server EC2 instance (Europe) i386',
+    'us-east-1-amd64-instance': 'Ubuntu Server EC2 instance (US-East) amd64',
+    'us-east-1-i386-instance': 'Ubuntu Server EC2 instance (US-East) i386',
+    'us-west-1-amd64-instance': 'Ubuntu Server EC2 instance (US-West-1) amd64',
+    'us-west-1-i386-instance': 'Ubuntu Server EC2 instance (US-West-1) i386',
+    'us-west-2-amd64-instance': 'Ubuntu Server EC2 instance (US-West-2) amd64',
+    'us-west-2-i386-instance': 'Ubuntu Server EC2 instance (US-West-2) i386',
+    'ap-southeast-1-amd64-instance': (
+        'Ubuntu Server EC2 instance (Asia-Pacific-SouthEast) amd64'),
+    'ap-southeast-1-i386-instance': (
+        'Ubuntu Server EC2 instance (Asia-Pacific-SouthEast) i386'),
+    'ap-southeast-1-amd64-ebs': (
+        'Ubuntu Server EC2 EBS (Asia-Pacific-SouthEast) amd64'),
+    'ap-southeast-1-i386-ebs': (
+        'Ubuntu Server EC2 EBS (Asia-Pacific-SouthEast) i386'),
+    'ap-northeast-1-amd64-instance': (
+        'Ubuntu Server EC2 instance (Asia-Pacific-NorthEast) amd64'),
+    'ap-northeast-1-i386-instance': (
+        'Ubuntu Server EC2 instance (Asia-Pacific-NorthEast) i386'),
+    'ap-northeast-1-amd64-ebs': (
+        'Ubuntu Server EC2 EBS (Asia-Pacific-NorthEast) amd64'),
+    'ap-northeast-1-i386-ebs': (
+        'Ubuntu Server EC2 EBS (Asia-Pacific-NorthEast) i386'),
+    'sa-east-1-amd64-ebs': (
+        'Ubuntu Server EC2 EBS (South-America-East-1) amd64'),
+    'sa-east-1-i386-ebs': 'Ubuntu Server EC2 EBS (South-America-East-1) i386',
+    'sa-east-1-amd64-instance': (
+        'Ubuntu Server EC2 instance (South-America-East-1) amd64'),
+    'sa-east-1-i386-instance': (
+        'Ubuntu Server EC2 instance (South-America-East-1) i386'),
+}
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Publish a provided list of AMIs to the QA tracker.")
+    parser.add_argument('-m', '--milestone',
+                        help='post to MILESTONE rather than the default')
+    parser.add_argument('-n', '--note', default="",
+                        help='set the note field on the build')
+    parser.add_argument('-t', '--target',
+                        help='post to an alternate QATracker')
+    parser.add_argument("input_file", type=str,
+                        help="An input file (published-ec2-daily.txt)")
+    args = parser.parse_args()
+
+    isotracker = ISOTracker(target=args.target)
+
+    if not os.path.exists(args.input_file):
+        print("Can't find input file: %s" % args.input_file)
+        sys.exit(1)
+
+    if args.milestone is None:
+        args.milestone = isotracker.default_milestone()
+
+    with open(args.input_file, 'r') as handle:
+        for line in handle:
+            zone, ami, arch, store = line.split()[0:4]
+            if not ami.startswith('ami-'):
+                continue
+            if store == 'instance-store':
+                store = 'instance'
+            try:
+                product = ec2_to_product_map['%s-%s-%s' % (zone, arch, store)]
+            except KeyError:
+                print("Can't find: %s-%s-%s" % (zone, arch, store))
+                continue
+
+            try:
+                isotracker.post_build(product, ami,
+                                      milestone=args.milestone,
+                                      note=args.note)
+            except KeyError as e:
+                print(e)
+                continue
+
+
+if __name__ == '__main__':
+    main()

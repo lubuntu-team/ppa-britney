@@ -1,0 +1,529 @@
+#! /usr/bin/python
+
+# Copyright (C) 2014 Canonical Ltd.
+# Author: Colin Watson <cjwatson@ubuntu.com>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+# Requires germinate >= 2.18.
+
+"""Copy a subset of one distribution into a derived distribution."""
+
+from __future__ import print_function
+
+import atexit
+from collections import OrderedDict
+from contextlib import closing, contextmanager
+import io
+import logging
+from optparse import OptionParser, Values
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+try:
+    from urllib.request import urlopen
+except ImportError:
+    from urllib2 import urlopen
+
+import apt_pkg
+from dateutil import parser as dateutil_parser
+from germinate.archive import TagFile
+from germinate.germinator import Germinator
+from germinate.seeds import Seed, SeedError, SeedStructure
+from launchpadlib.errors import HTTPError
+from launchpadlib.launchpad import Launchpad
+import pytz
+from ubuntutools.question import YesNoQuestion
+
+import lputils
+
+
+_bzr_cache_dir = None
+
+
+@contextmanager
+def open_url_as_text(url):
+    with closing(urlopen(url)) as raw:
+        with closing(io.BytesIO(raw.read())) as binary:
+            with closing(io.TextIOWrapper(binary)) as text:
+                yield text
+
+
+class ManifestError(Exception):
+    pass
+
+
+class TimeTravellingSeed(Seed):
+    def __init__(self, options, *args):
+        self.options = options
+        super(TimeTravellingSeed, self).__init__(*args, bzr=True)
+
+    def _bzr_revision_at_date(self, branch_url, date_obj):
+        """Work out the bzr revision of a branch at a particular date.
+
+        Unfortunately, bzr's date: revisionspec is unhelpful for this, as it
+        asks for the first revision *after* the given date, and fails if the
+        given date is after the last revision on the branch.  We could
+        probably do this properly with bzrlib, but life's too short and this
+        will do.
+
+        This assumes all sorts of things like the exact ordering of field
+        names in log output.  Since bzr is no longer being heavily
+        developed, hopefully this won't be a problem until we can switch the
+        seeds to git ...
+        """
+        command = ["bzr", "log", branch_url]
+        bzr_log = subprocess.Popen(
+            command, stdout=subprocess.PIPE, universal_newlines=True)
+        revno = None
+        for line in bzr_log.stdout:
+            line = line.rstrip("\n")
+            if line.startswith("revno: "):
+                revno = line[len("revno: "):].split(" ", 1)[0]
+            elif line.startswith("timestamp: "):
+                timestamp = dateutil_parser.parse(line[len("timestamp: "):])
+                if timestamp < date_obj:
+                    break
+        else:
+            revno = None
+        bzr_log.stdout.close()
+        bzr_log.wait()
+        if revno is None:
+            raise SeedError("No revision found at %s in %s" % (
+                date_obj, branch_url))
+        return revno
+
+    def _open_seed(self, base, branch, name, bzr=False):
+        if not bzr:
+            raise Exception("Non-bzr-based time travel is not supported.")
+
+        global _bzr_cache_dir
+        if _bzr_cache_dir is None:
+            _bzr_cache_dir = tempfile.mkdtemp(prefix="derive-distribution-")
+            atexit.register(shutil.rmtree, _bzr_cache_dir, ignore_errors=True)
+
+        path = os.path.join(base, branch)
+        checkout = os.path.join(_bzr_cache_dir, branch)
+        if not os.path.isdir(checkout):
+            revno = self._bzr_revision_at_date(path, self.options.date)
+            logging.info("Checking out %s at r%s" % (path, revno))
+            command = [
+                "bzr", "checkout", "--lightweight", "-r%s" % revno, path,
+                checkout,
+                ]
+            status = subprocess.call(command)
+            if status != 0:
+                raise SeedError(
+                    "Command failed with exit status %d:\n  '%s'" % (
+                        status, " ".join(command)))
+        return open(os.path.join(checkout, name))
+
+
+class TimeTravellingSeedStructure(SeedStructure):
+    def __init__(self, options, *args, **kwargs):
+        kwargs["bzr"] = True
+        self.options = options
+        super(TimeTravellingSeedStructure, self).__init__(*args, **kwargs)
+
+    def make_seed(self, bases, branches, name, bzr=False):
+        if not bzr:
+            raise Exception("Non-bzr-based time travel is not supported.")
+        return TimeTravellingSeed(self.options, bases, branches, name)
+
+
+class TimeTravellingGerminator:
+    apt_mirror = "http://people.canonical.com/~ubuntu-archive/apt-mirror.cgi"
+
+    def __init__(self, options):
+        self.options = options
+
+    @property
+    def components(self):
+        return ["main", "restricted", "universe", "multiverse"]
+
+    @property
+    def mirror(self):
+        if self.options.date is not None:
+            timestamp = int(time.mktime(self.options.date.timetuple()))
+            return "%s/%d" % (self.apt_mirror, timestamp)
+        else:
+            return self.apt_mirror
+
+    def makeSeedStructures(self, suite, flavours, extra_packages):
+        series_name = suite.split("-")[0]
+        if self.options.seed_source is None:
+            seed_bases = None
+        else:
+            seed_bases = self.options.seed_source.split(",")
+        structures = {}
+        for flavour in flavours:
+            try:
+                structure = TimeTravellingSeedStructure(
+                    self.options, "%s.%s" % (flavour, series_name),
+                    seed_bases=seed_bases)
+                if len(structure):
+                    extra_seed = []
+                    for extra_package in extra_packages:
+                        extra_seed.append(" * " + extra_package)
+                    if extra_seed:
+                        structure.add("extra-packages", extra_seed, "required")
+                        # Work around inability to specify extra packages
+                        # with no parent seeds.
+                        structure._inherit["extra-packages"] = []
+                    structures[flavour] = structure
+                    # TODO: We could save time later by mangling the
+                    # structure to remove seeds we don't care about.
+                else:
+                    logging.warning(
+                        "Skipping empty seed structure for %s.%s",
+                        flavour, series_name)
+            except SeedError as e:
+                logging.warning(
+                    "Failed to fetch seeds for %s.%s: %s",
+                    flavour, series_name, e)
+        return structures
+
+    def germinateArchFlavour(self, germinator, suite, arch, flavour, structure,
+                             seed_names):
+        """Germinate seeds on a single flavour for a single architecture."""
+        germinator.plant_seeds(structure)
+        germinator.grow(structure)
+        germinator.add_extras(structure)
+
+        # Unfortunately we have to use several bits of Germinate internals
+        # here.  I promise not to change them under myself without notifying
+        # myself.
+        all_seeds = OrderedDict()
+        for seed_name in seed_names:
+            seed = germinator._get_seed(structure, seed_name)
+            for inner_seed in germinator._inner_seeds(seed):
+                if inner_seed.name not in all_seeds:
+                    all_seeds[inner_seed.name] = inner_seed
+        if "extra-packages" in structure:
+            seed = germinator._get_seed(structure, "extra-packages")
+            for inner_seed in germinator._inner_seeds(seed):
+                if inner_seed.name not in all_seeds:
+                    all_seeds[inner_seed.name] = inner_seed
+        for seed in all_seeds.values():
+            sources = seed._sourcepkgs | seed._build_sourcepkgs
+            for source in sources:
+                version = germinator._sources[source]["Version"]
+                if (source in self._versions and
+                        self._versions[source] != version):
+                    # This requires manual investigation, as the resulting
+                    # derived distribution series can only have one version
+                    # of any given source package.
+                    raise Exception(
+                        "Conflicting source versions: seed %s/%s requires "
+                        "%s %s, but already present at version %s" % (
+                            flavour, seed, source, version,
+                            self._versions[source]))
+                self._versions[source] = version
+
+    def checkImageManifest(self, germinator, arch, manifest_url):
+        ok = True
+        with open_url_as_text(manifest_url) as manifest:
+            for line in manifest:
+                try:
+                    package, version = line.split()
+                    if package.startswith("click:"):
+                        continue
+                    package = package.split(":", 1)[0]
+                    if package not in germinator._packages:
+                        raise ManifestError(
+                            "%s not found for %s (from %s)" % (
+                                package, arch, manifest_url))
+                    gpkg = germinator._packages[package]
+                    if gpkg["Version"] != version:
+                        raise ManifestError(
+                            "Found %s %s for %s, but wanted %s "
+                            "(from %s)" % (
+                                package, gpkg["Version"], arch, version,
+                                manifest_url))
+                    if gpkg["Source"] not in self._versions:
+                        raise ManifestError(
+                            "%s not copied (from %s)" % (
+                                gpkg["Source"], manifest_url))
+                except ManifestError as e:
+                    logging.error(e.message)
+                    ok = False
+        return ok
+
+    def germinateArch(self, suite, components, arch, flavours, structures):
+        """Germinate seeds on all flavours for a single architecture."""
+        germinator = Germinator(arch)
+
+        # Read archive metadata.
+        logging.info("Reading archive for %s/%s", suite, arch)
+        archive = TagFile(suite, components, arch, self.mirror, cleanup=True)
+        germinator.parse_archive(archive)
+
+        if self.options.all_packages:
+            for source in germinator._sources:
+                self._versions[source] = germinator._sources[source]["Version"]
+        else:
+            for flavour, seed_names in flavours.items():
+                logging.info("Germinating for %s/%s/%s", flavour, suite, arch)
+                self.germinateArchFlavour(
+                    germinator, suite, arch, flavour, structures[flavour],
+                    seed_names)
+
+        ok = True
+        if self.options.check_image_manifest:
+            for manifest_id in self.options.check_image_manifest:
+                manifest_arch, manifest_url = manifest_id.split(":", 1)
+                if arch != manifest_arch:
+                    continue
+                if not self.checkImageManifest(germinator, arch, manifest_url):
+                    ok = False
+
+        return ok
+
+    def getVersions(self, full_seed_names, extra_packages):
+        self._versions = {}
+
+        suite = self.options.suite
+        components = self.components
+        architectures = [
+            a.architecture_tag for a in self.options.architectures]
+        flavours = OrderedDict()
+        for full_seed_name in full_seed_names:
+            flavour, seed_name = full_seed_name.split("/")
+            flavours.setdefault(flavour, []).append(seed_name)
+
+        if self.options.all_packages:
+            structures = None
+        else:
+            logging.info("Reading seed structures")
+            structures = self.makeSeedStructures(
+                suite, flavours, extra_packages)
+        if self.options.all_packages or structures:
+            ok = True
+            for arch in architectures:
+                if not self.germinateArch(
+                        suite, components, arch, flavours, structures):
+                    ok = False
+            if not ok:
+                sys.exit(1)
+
+        return self._versions
+
+
+def retry_on_error(func, *args, **kwargs):
+    # Since failure will be expensive to restart from scratch, we try this a
+    # few times in case of failure.
+    for i in range(3):
+        try:
+            return func(*args, **kwargs)
+        except HTTPError as e:
+            print(e.content, file=sys.stderr)
+            if i == 2:
+                raise
+            time.sleep(15)
+
+
+def derive_distribution(options, args):
+    full_seed_names = [
+        arg[len("seed:"):] for arg in args if arg.startswith("seed:")]
+    if not full_seed_names and not options.all_packages:
+        raise Exception(
+            "You must specify at least one seed name (in the form "
+            "seed:COLLECTION/NAME).")
+    extra_packages = [arg for arg in args if not arg.startswith("seed:")]
+    ttg = TimeTravellingGerminator(options)
+    versions = ttg.getVersions(full_seed_names, extra_packages)
+
+    if options.excludes:
+        for exclude in options.excludes:
+            versions.pop(exclude, None)
+
+    # Skip anything we already have, to simplify incremental copies.
+    original_versions = dict(versions)
+    removable = {}
+    newer = {}
+    for spph in options.destination.archive.getPublishedSources(
+            distro_series=options.destination.series,
+            pocket=options.destination.pocket, status="Published"):
+        source = spph.source_package_name
+        if source not in versions:
+            removable[source] = spph.source_package_version
+        else:
+            diff = apt_pkg.version_compare(
+                versions[source], spph.source_package_version)
+            if diff < 0:
+                newer[source] = spph
+            elif diff == 0:
+                del versions[source]
+
+    print("Copy candidates:")
+    for source, version in sorted(versions.items()):
+        print("\t%s\t%s" % (source, version))
+    print()
+
+    if newer:
+        print("These packages previously had newer version numbers:")
+        for source, spph in sorted(newer.items()):
+            print(
+                "\t%s\t%s -> %s" % (
+                    source, spph.source_package_version, versions[source]))
+        print()
+
+    if removable:
+        print("These packages could possibly be removed:")
+        for source, version in sorted(removable.items()):
+            print("\t%s\t%s" % (source, version))
+        print()
+
+    if options.dry_run:
+        print("Dry run; no packages copied.")
+    else:
+        if YesNoQuestion().ask("Copy", "no") == "no":
+            return False
+
+        print("Setting packaging information ...")
+        for source in sorted(versions.keys()):
+            sp = options.series.getSourcePackage(name=source)
+            if sp.productseries_link is not None:
+                derived_sp = options.destination.series.getSourcePackage(
+                    name=source)
+                if derived_sp.productseries_link is None:
+                    retry_on_error(
+                        derived_sp.setPackaging,
+                        productseries=sp.productseries_link)
+            print(".", end="")
+            sys.stdout.flush()
+        print()
+
+        # Wouldn't it be lovely if we could do a single copyPackages call
+        # with a giant dictionary of source package names to versions?  As
+        # it is we need to call copyPackage a few thousand times instead.
+        archive = options.destination.archive
+        for source, version in sorted(versions.items()):
+            print("\t%s\t%s" % (source, version))
+            if source in newer:
+                retry_on_error(
+                    newer[source].requestDeletion,
+                    removal_comment=(
+                        "derive-distribution rewinding to %s" % version))
+            retry_on_error(
+                archive.copyPackage,
+                source_name=source, version=version,
+                from_archive=options.archive,
+                to_pocket=options.destination.pocket,
+                to_series=options.destination.series.name,
+                include_binaries=True, auto_approve=True, silent=True)
+
+        print("Checking package sets ...")
+        found_any_set = False
+        for source_set in options.launchpad.packagesets.getBySeries(
+                distroseries=options.series):
+            sources = source_set.getSourcesIncluded(direct_inclusion=True)
+            if set(sources) & set(original_versions):
+                print("\t%s" % source_set.name)
+                found_any_set = True
+        if found_any_set:
+            print(
+                "A member of ~techboard needs to copy the above package sets "
+                "to the new series.")
+
+        return True
+
+
+def main():
+    logging.basicConfig(level=logging.INFO)
+    logging.getLogger("germinate").setLevel(logging.CRITICAL)
+    apt_pkg.init()
+
+    parser = OptionParser(
+        usage="usage: %prog --to-distribution distribution [options]")
+    parser.add_option(
+        "-l", "--launchpad", dest="launchpad_instance", default="production")
+    parser.add_option(
+        "-n", "--dry-run", default=False, action="store_true",
+        help="only show actions that would be performed")
+    parser.add_option(
+        "-d", "--distribution", default="ubuntu",
+        metavar="DISTRIBUTION", help="copy from DISTRIBUTION")
+    parser.add_option("-s", "--suite", metavar="SUITE", help="copy from SUITE")
+    parser.add_option(
+        "-a", "--architecture", dest="architectures", action="append",
+        metavar="ARCHITECTURE",
+        help="architecture tag (may be given multiple times)")
+    parser.add_option(
+        "--to-distribution", metavar="DISTRIBUTION",
+        help="copy to DISTRIBUTION")
+    parser.add_option(
+        "--to-suite", metavar="SUITE",
+        help="copy to SUITE (default: copy from suite)")
+    parser.add_option(
+        "--date", metavar="DATE", help=(
+            "copy from suite as it existed on DATE; assumes UTC if timezone "
+            "not specified"))
+    parser.add_option("--seed-source", help="fetch seeds from SOURCE")
+    parser.add_option(
+        "--check-image-manifest", action="append", metavar="ARCH:URL", help=(
+            "ensure that all packages from the manifest at URL for "
+            "architecture ARCH are copied (may be given multiple times)"))
+    parser.add_option(
+        "--exclude", dest="excludes", action="append", metavar="PACKAGE",
+        help="don't copy PACKAGE (may be given multiple times)")
+    parser.add_option(
+        "--all-packages", default=False, action="store_true",
+        help="copy all packages in source suite rather than germinating")
+    options, args = parser.parse_args()
+
+    if not args and not options.all_packages:
+        parser.error("You must specify some seeds or packages to copy.")
+
+    if options.launchpad_instance == "dogfood":
+        # Work around old service root in some versions of launchpadlib.
+        options.launchpad_instance = "https://api.dogfood.paddev.net/"
+    options.launchpad = Launchpad.login_with(
+        "derive-distribution", options.launchpad_instance, version="devel")
+    lputils.setup_location(options)
+    options.destination = Values()
+    options.destination.launchpad = options.launchpad
+    options.destination.distribution = options.to_distribution
+    options.destination.suite = options.to_suite
+    options.destination.architectures = [
+        a.architecture_tag for a in options.architectures]
+
+    # In cases where source is specified, but destination is not, default to
+    # destination = source.
+    if options.destination.distribution is None:
+        options.destination.distribution = options.distribution
+    if options.destination.suite is None:
+        options.destination.suite = options.suite
+
+    if options.date is not None:
+        options.date = dateutil_parser.parse(options.date)
+        if options.date.tzinfo is None:
+            options.date = options.date.replace(tzinfo=pytz.UTC)
+
+    lputils.setup_location(options.destination)
+
+    if (options.distribution == options.destination.distribution and
+            options.suite == options.destination.suite):
+        parser.error("copy destination must differ from source")
+
+    if derive_distribution(options, args):
+        return 0
+    else:
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

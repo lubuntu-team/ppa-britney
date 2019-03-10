@@ -1,0 +1,190 @@
+#! /usr/bin/python3
+
+# Copyright (C) 2011, 2012  Canonical Ltd.
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+# This script can be used to reschedule some of the copy archives
+# builds so that they are processed like regular PPA builds.
+#
+# Copy archives builds have a huge penalty applied to them which means
+# that they are only processed when there is nothing else being processed
+# by the build farm. That's usually fine, but for some rebuilds, we want
+# more timely processing, while at the same time, we do want to continue to
+# service regular PPA builds.
+#
+# This script will try to have a portion of the build farm processing copy
+# builds. It does that by rescoring builds to the normal build priority
+# range. But will only rescore a few builds at a time, so as not to take ove
+# the build pool. By default, it won't rescore more than 1/4 the number of
+# available builders. So for example, if there are 12 i386 builders, only
+# 3 builds at a time will have a "normal priority".
+
+import argparse
+from collections import defaultdict
+import logging
+import time
+
+from launchpadlib.launchpad import Launchpad
+
+
+API_NAME = 'copy-build-scheduler'
+
+NEEDS_BUILDING = 'Needs building'
+BUILDING = 'Currently building'
+COPY_ARCHIVE_SCORE_PENALTY = 2600
+# Number of minutes to wait between schedule run.
+SCHEDULE_PERIOD = 5
+
+
+def determine_builder_capacity(lp, args):
+    """Find how many builders to use for copy builds by processor."""
+    capacity = {}
+    for processor in args.processors:
+        queue = [
+            builder for builder in lp.builders.getBuildersForQueue(
+                processor='/+processors/%s' % processor, virtualized=True)
+            if builder.active]
+        max_capacity = len(queue)
+        capacity[processor] = round(max_capacity * args.builder_ratio)
+        # Make sure at least 1 builders is associated
+        if capacity[processor] == 0:
+            capacity[processor] = 1
+        logging.info(
+            'Will use %d out of %d %s builders', capacity[processor],
+            max_capacity, processor)
+    return capacity
+
+
+def get_archive_used_builders_capacity(archive):
+    """Return the number of builds currently being done for the archive."""
+    capacity = defaultdict(int)
+    building = archive.getBuildRecords(build_state=BUILDING)
+    for build in building:
+        capacity[build.arch_tag] += 1
+    return capacity
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '--lp-instance', default='production', dest='lp_instance',
+        help="Select the Launchpad instance to run against. Defaults to "
+        "'production'")
+    parser.add_argument(
+        '-v', '--verbose', default=0, action='count', dest='verbose',
+        help="Increase verbosity of the script. -v prints info messages"
+        "-vv will print debug messages.")
+    parser.add_argument(
+        '-c', '--credentials', default=None, action='store',
+        dest='credentials',
+        help="Use the OAuth credentials in FILE instead of the desktop "
+        "one.", metavar='FILE')
+    parser.add_argument(
+        '-d', '--distribution', default='ubuntu', action='store',
+        dest='distribution',
+        help="The archive distribution. Defaults to 'ubuntu'.")
+    parser.add_argument(
+        '-p', '--processor', action='append', dest='processors',
+        help="The processor for which to schedule builds. "
+        "Default to i386 and amd64.")
+    parser.add_argument(
+        '-r', '--ratio', default=0.25, action='store', type=float,
+        dest='builder_ratio',
+        help="The ratio of builders that you want to use for the copy "
+        "builds.  Default to 25%% of the available builders.")
+    parser.add_argument('copy_archive_name', help='Name of copy archive')
+    args = parser.parse_args()
+
+    if args.verbose >= 2:
+        log_level = logging.DEBUG
+    elif args.verbose == 1:
+        log_level = logging.INFO
+    else:
+        log_level = logging.WARNING
+    logging.basicConfig(level=log_level)
+
+    if args.builder_ratio >= 1 or args.builder_ratio < 0:
+        parser.error(
+            'ratio should be a float between 0 and 1: %s' %
+            args.builder_ratio)
+
+    if not args.processors:
+        args.processors = ['amd64', 'i386']
+
+    lp = Launchpad.login_with(
+        API_NAME, args.lp_instance,
+        credentials_file=args.credentials,
+        version='devel')
+
+    try:
+        distribution = lp.distributions[args.distribution]
+    except KeyError:
+        parser.error('unknown distribution: %s' % args.distribution)
+
+    archive = distribution.getArchive(name=args.copy_archive_name)
+    if archive is None:
+        parser.error('unknown archive: %s' % args.copy_archive_name)
+
+    iteration = 0
+    while True:
+        # Every 5 schedules run - and on the first - compute available
+        # capacity.
+        if (iteration % 5) == 0:
+            capacity = determine_builder_capacity(lp, args)
+        iteration += 1
+
+        pending_builds = archive.getBuildRecords(build_state=NEEDS_BUILDING)
+        logging.debug('Found %d pending builds.' % len(pending_builds))
+        if len(pending_builds) == 0:
+            logging.info('No more builds pending. We are done.')
+            break
+
+        used_capacity = get_archive_used_builders_capacity(archive)
+
+        # For each processor, rescore up as many builds as we have
+        # capacity for.
+        for processor in args.processors:
+            builds_to_rescore = (
+                capacity[processor] - used_capacity.get(processor, 0))
+            logging.debug(
+                'Will try to rescore %d %s builds', builds_to_rescore,
+                processor)
+            for build in pending_builds:
+                if builds_to_rescore <= 0:
+                    break
+
+                if build.arch_tag != processor:
+                    continue
+
+                if build.score < 0:
+                    # Only rescore builds that look like the negative
+                    # copy archive modified have been applied.
+                    logging.info('Rescoring %s' % build.title)
+                    # This should make them considered like a regular build.
+                    build.rescore(
+                        score=build.score + COPY_ARCHIVE_SCORE_PENALTY)
+                else:
+                    logging.debug('%s already rescored', build.title)
+
+                # If the score was already above 0, it was probably
+                # rescored already, count it against our limit anyway.
+                builds_to_rescore -= 1
+
+        # Reschedule in a while.
+        logging.debug('Sleeping for %d minutes.', SCHEDULE_PERIOD)
+        time.sleep(SCHEDULE_PERIOD * 60)
+
+
+if __name__ == '__main__':
+    main()

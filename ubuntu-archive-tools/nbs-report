@@ -1,0 +1,280 @@
+#!/usr/bin/python
+
+# Copyright (C) 2011, 2012  Canonical Ltd.
+# Author: Martin Pitt <martin.pitt@ubuntu.com>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+# Generate a HTML report of current NBS binary packages from a checkrdepends
+# output directory
+
+from __future__ import print_function
+
+from collections import defaultdict
+import csv
+from optparse import OptionParser
+import os
+import sys
+import time
+
+from charts import make_chart, make_chart_header
+
+
+def parse_checkrdepends_file(path, pkgmap):
+    '''Parse one checkrdepends file into the NBS map'''
+
+    cur_component = None
+    cur_arch = None
+
+    with open(path) as f:
+        for line in f:
+            if line.startswith('-- '):
+                (cur_component, cur_arch) = line.split('/', 1)[1].split()[:2]
+                continue
+            assert cur_component
+            assert cur_arch
+
+            rdep = line.strip().split()[0]
+            pkgmap.setdefault(rdep, (cur_component, []))[1].append(cur_arch)
+
+
+def _pkg_removable(pkg, nbs, checked_v):
+    '''Recursively check if pakcage is removable.
+
+    checked_v is the working set of already checked vertices, to avoid infinite
+    loops.
+    '''
+    checked_v.add(pkg)
+    for rdep in nbs.get(pkg, []):
+        if rdep in checked_v:
+            continue
+        #checked_v.add(rdep)
+        if not rdep in nbs:
+            try:
+                checked_v.remove(rdep)
+            except KeyError:
+                pass
+            return False
+        if not _pkg_removable(rdep, nbs, checked_v):
+            try:
+                checked_v.remove(rdep)
+            except KeyError:
+                pass
+            return False
+    return True
+
+
+def get_removables(nbs):
+    '''Get set of removable packages.
+
+    This includes packages with no rdepends and disconnected subgraphs, i. e.
+    clusters of NBS packages which only depend on each other.
+    '''
+    removable = set()
+
+    for p in nbs:
+        if p in removable:
+            continue
+        checked_v = set()
+        if _pkg_removable(p, nbs, checked_v):
+            # we can add the entire cluster here, not just p; avoids
+            # re-checking the other vertices in that cluster
+            removable.update(checked_v)
+
+    return removable
+
+
+def html_report(options, nbs, removables):
+    '''Generate HTML report from NBS map.'''
+
+    print('''\
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN"
+ "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
+<head>
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+  <title>NBS packages</title>
+  <style type="text/css">
+    body { background: #CCCCB0; color: black; }
+    a { text-decoration: none; }
+    table { border-collapse: collapse; border-style: none none;
+            margin-bottom: 3ex; empty-cells: show; }
+    table th { text-align: left; border-style: solid none none none;
+               border-width: 3px; padding-right: 10px; }
+    table td { vertical-align:top; text-align: left; border-style: dotted none;
+               border-width: 1px; padding-right: 10px; }
+    .normal { }
+    .removable { color: green; font-weight: bold; }
+    .nbs { color: blue; }
+    .componentsup { font-size: 70%%; color: red; font-weight: bold; }
+    .componentunsup { font-size: 70%%; color: darkred; }
+  </style>
+  %s
+</head>
+<body>
+<h1>NBS: Binary packages not built from any source</h1>
+
+<h2>Archive Administrator commands</h2>
+<p>Run this command to remove NBS packages which are not required any more:</p>
+''' % make_chart_header())
+
+    print('<p style="font-family: monospace">remove-package -m NBS '
+          '-d %s -s %s -b -y %s</p>' %
+          (options.distribution, options.suite, ' '.join(sorted(removables))))
+
+    print('''
+<h2>Reverse dependencies</h2>
+
+<p><span class="nbs">Reverse dependencies which are NBS themselves</span><br/>
+<span class="removable">NBS package which can be removed safely</span></p>
+<table>
+''')
+    reverse_nbs = defaultdict(list)  # non_nbs_pkg -> [nbspkg1, ...]
+    pkg_component = {}  # non_nbs_pkg -> (component, component_class)
+
+    for pkg in sorted(nbs):
+        nbsmap = nbs[pkg]
+        if pkg in removables:
+            cls = 'removable'
+        else:
+            cls = 'normal'
+        print('<tr><th colspan="4"><span class="%s">%s</span></td></tr>' %
+              (cls, pkg), end="")
+        for rdep in sorted(nbsmap):
+            (component, arches) = nbsmap[rdep]
+
+            if component in ('main', 'restricted'):
+                component_cls = 'sup'
+            else:
+                component_cls = 'unsup'
+
+            if rdep in nbs:
+                if rdep in removables:
+                    cls = 'removable'
+                else:
+                    cls = 'nbs'
+            else:
+                cls = 'normal'
+                reverse_nbs[rdep].append(pkg)
+                pkg_component[rdep] = (component, component_cls)
+
+            print('<tr><td>&nbsp; &nbsp; </td>', end='')
+            print('<td><span class="%s">%s</span></td> ' % (cls, rdep), end='')
+            print('<td><span class="component%s">%s</span></td>' %
+                  (component_cls, component), end='')
+            print('<td>%s</td></tr>' % ' '.join(arches))
+
+    print('''</table>
+<h2>Packages which depend on NBS packages</h2>
+<table>''')
+
+    def sort_rev_nbs(k1, k2):
+        len_cmp = cmp(len(reverse_nbs[k1]), len(reverse_nbs[k2]))
+        if len_cmp == 0:
+            return cmp(k1, k2)
+        else:
+            return -len_cmp
+
+    for pkg in sorted(reverse_nbs, cmp=sort_rev_nbs):
+        print('<tr><td>%s</td> '
+              '<td><span class="component%s">%s</span></td><td>' % (
+                  pkg, pkg_component[pkg][1], pkg_component[pkg][0]), end="")
+        print(" ".join(sorted(reverse_nbs[pkg])), end="")
+        print('</td></tr>')
+
+    print('</table>')
+
+    if options.csv_file is not None:
+        print("<h2>Over time</h2>")
+        print(make_chart(
+            os.path.basename(options.csv_file), ["removable", "total"]))
+
+    print('<p><small>Generated at %s.</small></p>' %
+          time.strftime('%Y-%m-%d %H:%M:%S %Z', time.gmtime(options.time)))
+    print('</body></html>')
+
+
+def main():
+    parser = OptionParser(
+        usage="%prog <checkrdepends output directory>",
+        description="Generate an HTML report of current NBS binary packages.")
+    parser.add_option('-d', '--distribution', default='ubuntu')
+    parser.add_option('-s', '--suite', default='disco')
+    parser.add_option(
+        '--csv-file', help='record CSV time series data in this file')
+    options, args = parser.parse_args()
+    if len(args) != 1:
+        parser.error("need a checkrdepends output directory")
+
+    options.time = time.time()
+
+    # pkg -> rdep_pkg -> (component, [arch1, arch2, ...])
+    nbs = defaultdict(dict)
+
+    for f in os.listdir(args[0]):
+        if f.startswith('.') or f.endswith('.html'):
+            continue
+        parse_checkrdepends_file(os.path.join(args[0], f), nbs[f])
+
+    #with open('/tmp/dot', 'w') as dot:
+    #    print('digraph {', file=dot)
+    #    print('   ratio 0.1', file=dot)
+    #    pkgnames = set(nbs)
+    #    for m in nbs.itervalues():
+    #        pkgnames.update(m)
+    #    for n in pkgnames:
+    #        print('  %s [label="%s"' % (n.replace('-', '').replace('.', ''), n),
+    #              end="", file=dot)
+    #        if n in nbs:
+    #            print(', style="filled", fillcolor="lightblue"', end="", file=dot)
+    #        print(']', file=dot)
+    #    print(file=dot)
+    #    for pkg, map in nbs.iteritems():
+    #        for rd in map:
+    #            print('  %s -> %s' % (
+    #                    pkg.replace('-', '').replace('.', ''),
+    #                    rd.replace('-', '').replace('.', '')), file=dot)
+    #    print('}', file=dot)
+
+    removables = get_removables(nbs)
+
+    html_report(options, nbs, removables)
+
+    if options.csv_file is not None:
+        if sys.version < "3":
+            open_mode = "ab"
+            open_kwargs = {}
+        else:
+            open_mode = "a"
+            open_kwargs = {"newline": ""}
+        csv_is_new = not os.path.exists(options.csv_file)
+        with open(options.csv_file, open_mode, **open_kwargs) as csv_file:
+            # Field names deliberately hardcoded; any changes require
+            # manually rewriting the output file.
+            fieldnames = [
+                "time",
+                "removable",
+                "total",
+                ]
+            csv_writer = csv.DictWriter(csv_file, fieldnames)
+            if csv_is_new:
+                csv_writer.writeheader()
+            csv_writer.writerow({
+                "time": int(options.time * 1000),
+                "removable": len(removables),
+                "total": len(nbs),
+                })
+
+
+if __name__ == '__main__':
+    main()

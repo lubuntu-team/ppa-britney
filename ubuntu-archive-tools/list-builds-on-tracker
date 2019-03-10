@@ -1,0 +1,46 @@
+#!/usr/bin/python
+# Copyright (C) 2012  Canonical Ltd.
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+import argparse
+
+# See isotracker.py for setup instructions.
+from isotracker import ISOTracker
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="List all the builds for a milestone.")
+    parser.add_argument('-m', '--milestone',
+                        help='post to MILESTONE rather than the default')
+    parser.add_argument('-t', '--target',
+                        help='post to an alternate QATracker')
+    args = parser.parse_args()
+
+    isotracker = ISOTracker(target=args.target)
+
+    if args.milestone is None:
+        args.milestone = isotracker.default_milestone()
+
+    products = {}
+    for entry in isotracker.tracker_products:
+        products[entry.id] = entry.title
+
+    builds = isotracker.get_builds(args.milestone)
+    for build in sorted(builds, key=lambda build: products[build.productid]):
+        print("{0:<60} {1:<15} {2:<15}".format(
+            products[build.productid], build.status_string, build.version))
+
+if __name__ == '__main__':
+    main()

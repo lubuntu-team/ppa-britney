@@ -1,0 +1,215 @@
+#! /usr/bin/python
+
+# Copyright 2013-2019 Canonical Ltd.
+# Author: Colin Watson <cjwatson@ubuntu.com>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+"""Manage build base images."""
+
+from __future__ import print_function
+
+__metaclass__ = type
+
+import argparse
+import hashlib
+import subprocess
+import sys
+try:
+    from urllib.parse import urlparse
+except ImportError:
+    from urlparse import urlparse
+
+from launchpadlib.launchpad import Launchpad
+from launchpadlib.uris import web_root_for_service_root
+from ubuntutools.question import YesNoQuestion
+
+import lputils
+
+
+# Convenience aliases.
+image_types = {
+    "chroot": "Chroot tarball",
+    "lxd": "LXD image",
+    }
+
+
+def describe_image_type(image_type):
+    if image_type == "Chroot tarball":
+        return "base chroot tarball"
+    elif image_type == "LXD image":
+        return "base LXD image"
+    else:
+        raise ValueError("unknown image type '%s'" % image_type)
+
+
+def get_chroot(args):
+    das = args.architectures[0]
+    suite_arch = "%s/%s" % (args.suite, das.architecture_tag)
+    url = das.getChrootURL(pocket=args.pocket, image_type=args.image_type)
+    if url is None:
+        print("No %s for %s" % (
+            describe_image_type(args.image_type), suite_arch))
+        return 1
+    if args.dry_run:
+        print("Would fetch %s" % url)
+    else:
+        # We use wget here to save on having to implement a progress bar
+        # with urlretrieve.
+        command = ["wget"]
+        if args.filepath is not None:
+            command.extend(["-O", args.filepath])
+        command.append(url)
+        subprocess.check_call(command)
+    return 0
+
+
+def info_chroot(args):
+    das = args.architectures[0]
+    url = das.getChrootURL(pocket=args.pocket, image_type=args.image_type)
+    if url is not None:
+        print(url)
+    return 0
+
+
+def remove_chroot(args):
+    das = args.architectures[0]
+    previous_url = das.getChrootURL(
+        pocket=args.pocket, image_type=args.image_type)
+    if previous_url is not None:
+        print("Previous %s: %s" % (
+            describe_image_type(args.image_type), previous_url))
+    suite_arch = "%s/%s" % (args.suite, das.architecture_tag)
+    if args.dry_run:
+        print("Would remove %s from %s" % (
+            describe_image_type(args.image_type), suite_arch))
+    else:
+        if not args.confirm_all:
+            if YesNoQuestion().ask(
+                    "Remove %s from %s" % (
+                        describe_image_type(args.image_type), suite_arch),
+                    "no") == "no":
+                return 0
+        das.removeChroot(pocket=args.pocket, image_type=args.image_type)
+    return 0
+
+
+def set_chroot(args):
+    das = args.architectures[0]
+    previous_url = das.getChrootURL(
+        pocket=args.pocket, image_type=args.image_type)
+    if previous_url is not None:
+        print("Previous %s: %s" % (
+            describe_image_type(args.image_type), previous_url))
+    suite_arch = "%s/%s" % (args.suite, das.architecture_tag)
+    if args.build_url:
+        target = "%s from %s" % (args.filepath, args.build_url)
+    else:
+        target = args.filepath
+    if args.dry_run:
+        print("Would set %s for %s to %s" % (
+            describe_image_type(args.image_type), suite_arch, target))
+    else:
+        if not args.confirm_all:
+            if YesNoQuestion().ask(
+                    "Set %s for %s to %s" % (
+                        describe_image_type(args.image_type), suite_arch, target),
+                    "no") == "no":
+                return 0
+        if args.build_url:
+            das.setChrootFromBuild(
+                livefsbuild=urlparse(args.build_url).path,
+                filename=args.filepath,
+                pocket=args.pocket, image_type=args.image_type)
+        else:
+            with open(args.filepath, "rb") as f:
+                data = f.read()
+                sha1sum = hashlib.sha1(data).hexdigest()
+            das.setChroot(
+                data=data, sha1sum=sha1sum,
+                pocket=args.pocket, image_type=args.image_type)
+    return 0
+
+
+commands = {
+    "get": get_chroot,
+    "info": info_chroot,
+    "remove": remove_chroot,
+    "set": set_chroot}
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-l", "--launchpad", dest="launchpad_instance", default="production")
+    parser.add_argument(
+        "-n", "--dry-run", default=False, action="store_true",
+        help="only show removals that would be performed")
+    parser.add_argument(
+        "-y", "--confirm-all", default=False, action="store_true",
+        help="do not ask for confirmation")
+    parser.add_argument(
+        "-d", "--distribution", default="ubuntu",
+        metavar="DISTRIBUTION", help="manage base images for DISTRIBUTION")
+    parser.add_argument(
+        "-s", "--suite", "--series", dest="suite", metavar="SUITE",
+        help="manage base images for SUITE")
+    parser.add_argument(
+        "-a", "--architecture", metavar="ARCHITECTURE", required=True,
+        help="manage base images for ARCHITECTURE")
+    parser.add_argument(
+        "-i", "--image-type", metavar="TYPE", default="Chroot tarball",
+        help="manage base images of type TYPE")
+    parser.add_argument(
+        "--from-build", dest="build_url", metavar="URL",
+        help="Live filesystem build URL to set base image from")
+    parser.add_argument(
+        "-f", "--filepath", metavar="PATH",
+        help="Base image file path (or file name if --from-build is given)")
+    parser.add_argument("command", choices=sorted(commands.keys()))
+    args = parser.parse_args()
+
+    if args.command == "set" and args.filepath is None:
+        parser.error("The set command requires a base image file path (-f).")
+
+    if args.image_type not in image_types.values():
+        image_type = image_types.get(args.image_type.lower())
+        if image_type is not None:
+            args.image_type = image_type
+        else:
+            parser.error("Unknown image type '%s'." % args.image_type)
+
+    if args.command in ("get", "info"):
+        login_method = Launchpad.login_anonymously
+    else:
+        login_method = Launchpad.login_with
+    args.launchpad = login_method(
+        "manage-chroot", args.launchpad_instance, version="devel")
+    lputils.setup_location(args)
+
+    if args.command == "set" and args.build_url:
+        parsed_build_url = urlparse(args.build_url)
+        if parsed_build_url.scheme != "":
+            service_host = args.launchpad._root_uri.host
+            web_host = urlparse(web_root_for_service_root(
+                str(args.launchpad._root_uri))).hostname
+            if parsed_build_url.hostname not in (service_host, web_host):
+                parser.error(
+                    "%s is not on this Launchpad instance (%s)" % (
+                        args.build_url, web_host))
+
+    return commands[args.command](args)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

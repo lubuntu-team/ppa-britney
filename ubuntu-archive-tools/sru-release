@@ -1,0 +1,395 @@
+#!/usr/bin/python
+
+# Copyright (C) 2011, 2012 Canonical Ltd.
+# Author: Martin Pitt <martin.pitt@canonical.com>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+'''Release a proposed stable release update.
+
+Copy packages from -proposed to -updates, and optionally to -security and the
+development release.
+
+USAGE:
+   sru-release [-s] [-d] <release> <package> [<package> ...]
+'''
+
+from __future__ import print_function
+
+from collections import defaultdict
+from functools import partial
+import optparse
+import sys
+import unittest
+
+try:
+    from urllib.request import urlopen
+except ImportError:
+    from urllib import urlopen
+
+from launchpadlib.launchpad import Launchpad
+
+
+# Each entry in this list is a list of source packages that are known
+# to have inter-dependencies and must be released simultaneously.
+# If possible, each list should be ordered such that earlier
+# entries could be released slightly before subsequent entries.
+RELEASE_TOGETHER_PACKAGE_GROUPS = [
+    ['linux-hwe', 'linux-meta-hwe'],
+    ['linux', 'linux-meta'],
+    ['grub2', 'grub2-signed'],
+    ['shim', 'shim-signed'],
+]
+
+MISSING_PACKAGES_FROM_GROUP = (
+    "The set of packages requested for release are listed as dangerous \n"
+    "to release without also releasing the following at the same time:\n"
+    "   {missing}\n\n"
+    "For more information, see:\n"
+    " https://lists.ubuntu.com/archives/ubuntu-devel/2018-June/040380.html\n\n"
+    "To ignore this message, pass '--skip-package-group-check'.")
+
+
+def check_package_sets(packages):
+    """Return a re-ordered list of packages respecting the PACKAGE_SETS
+    defined above.  If any packages are missing, raise error."""
+
+    # pkg2group is a dict where each key is a pkg in a group and value is the
+    # complete group.
+    pkg2group = {}
+    for pgroup in RELEASE_TOGETHER_PACKAGE_GROUPS:
+        for pkg in pgroup:
+            if pkg in pkg2group:
+                raise RuntimeError(
+                    "Overlapping package groups. '%s' is in '%s' and '%s'." %
+                    (pkg, pgroup, pkg2group[pkg]))
+            pkg2group[pkg] = pgroup
+
+    seen = set()
+    new_pkgs = []
+    for pkg in packages:
+        if pkg not in pkg2group:
+            add = [pkg]
+        else:
+            add = list(pkg2group[pkg])
+        new_pkgs.extend([a for a in add if a not in seen])
+        seen.update(add)
+
+    orig = set(packages)
+    new = set(new_pkgs)
+    if orig != new:
+        raise ValueError(
+            MISSING_PACKAGES_FROM_GROUP.format(
+                missing=' '.join(new.difference(orig))))
+    return new_pkgs
+
+
+class CheckPackageSets(unittest.TestCase):
+    def test_expected_linux_order_fixed(self):
+        self.assertEqual(
+            ['pkg1', 'linux', 'linux-meta', 'pkg2'],
+            check_package_sets(['pkg1', 'linux-meta', 'linux', 'pkg2']))
+
+    def test_raises_value_error_on_missing(self):
+        self.assertRaises(
+            ValueError, check_package_sets, ['pkg1', 'linux'])
+
+    def test_single_item_with_missing(self):
+        self.assertRaises(
+            ValueError, check_package_sets, ['linux'])
+
+    def test_single_item_without_missing(self):
+        self.assertEqual(
+            check_package_sets(['pkg1']), ['pkg1'])
+
+    def test_multiple_package_groups(self):
+        """Just make sure that having multiple groups listed still errors."""
+        self.assertRaises(
+            ValueError, check_package_sets, ['pkg1', 'linux', 'grub2'])
+
+
+def match_srubugs(options, changesfileurl):
+    '''match between bugs with verification- tag and bugs in changesfile'''
+
+    bugs = []
+
+    if changesfileurl is None:
+        return bugs
+
+    # Load changesfile
+    changelog = urlopen(changesfileurl)
+    bugnums = []
+    for l in changelog:
+        if l.startswith('Launchpad-Bugs-Fixed: '):
+            bugnums = l.split()[1:]
+            break
+
+    for b in bugnums:
+        if b in options.exclude_bug:
+            continue
+        try:
+            bugs.append(launchpad.bugs[int(b)])
+        except:
+            print('%s: bug %s does not exist or is not accessible' %
+                  (changesfileurl, b))
+
+    return bugs
+
+
+def update_sru_bug(bug, pkg):
+    '''Unsubscribe SRU team and comment on bug re: how to report regressions'''
+    m_subjects = [m.subject for m in bug.messages]
+    if 'Update Released' in m_subjects:
+        print('LP: #%s was not commented on' % bug.id)
+        return
+    sru_team = launchpad.people['ubuntu-sru']
+    bug.unsubscribe(person=sru_team)
+    text = ("The verification of the Stable Release Update for %s has "
+            "completed successfully and the package has now been released "
+            "to -updates.  Subsequently, the Ubuntu Stable Release Updates "
+            "Team is being unsubscribed and will not receive messages "
+            "about this bug report.  In the event that you encounter "
+            "a regression using the package from -updates please report "
+            "a new bug using ubuntu-bug and tag the bug report "
+            "regression-update so we can easily find any regressions." % pkg)
+    bug.newMessage(subject="Update Released", content=text)
+    bug.lp_save()
+
+
+def get_versions(options, sourcename):
+    '''Get current package versions.
+
+    If options.pattern is True, return all versions for package names
+    matching options.pattern.
+    If options.pattern is False, only return one result.
+
+    Return map pkgname -> {'release': version, 'updates': version,
+      'proposed': version, 'changesfile': url_of_proposed_changes,
+      'published': proposed_date}
+    '''
+    versions = defaultdict(dict)
+    if options.esm:
+        pocket = 'Release'
+    else:
+        pocket = 'Proposed'
+
+    matches = src_archive.getPublishedSources(
+        source_name=sourcename, exact_match=not options.pattern,
+        status='Published', pocket=pocket, distro_series=series)
+    for match in matches:
+        # versions in all pockets
+        for pub in src_archive.getPublishedSources(
+                source_name=match.source_package_name, exact_match=True,
+                status='Published', distro_series=series):
+            key = pub.pocket.lower()
+            # special case for ESM ppas, which don't have pockets but need
+            # to be treated as -proposed
+            if options.esm and key == 'release':
+                key = 'proposed'
+            versions[pub.source_package_name][key] = (
+                pub.source_package_version)
+            if pocket in pub.pocket:
+                versions[pub.source_package_name]['changesfile'] = (
+                    pub.changesFileUrl())
+        # When the destination archive differs from the source scan that too.
+        if dst_archive != src_archive:
+            for pub in dst_archive.getPublishedSources(
+                    source_name=match.source_package_name, exact_match=True,
+                    status='Published', distro_series=series):
+                key = 'security' # pub.pocket.lower()
+                versions[pub.source_package_name][key] = (
+                    pub.source_package_version)
+                if pocket in pub.pocket:
+                    versions[pub.source_package_name]['changesfile'] = (
+                        pub.changesFileUrl())
+            
+        # devel version
+        if devel_series:
+            for pub in src_archive.getPublishedSources(
+                    source_name=match.source_package_name, exact_match=True,
+                    status='Published', distro_series=devel_series):
+                if pub.pocket in ('Release', 'Proposed'):
+                    versions[pub.source_package_name]['devel'] = (
+                        pub.source_package_version)
+        else:
+            versions[match.source_package_name]['devel'] = None
+
+    return versions
+
+
+def release_package(options, package):
+    '''Release a package.'''
+
+    pkg_versions_map = get_versions(options, package)
+    if not pkg_versions_map:
+        message = 'ERROR: No such package, ' + package + ', in -proposed, aborting\n'
+        sys.stderr.write(message)
+        sys.exit(1)
+
+    for pkg, versions in pkg_versions_map.iteritems():
+        print('--- Releasing %s ---' % pkg)
+        print('Proposed: %s' % versions['proposed'])
+        if 'security' in versions:
+            print('Security: %s' % versions['security'])
+        if 'updates' in versions:
+            print('Updates:  %s' % versions['updates'])
+        else:
+            print('Release:  %s' % versions.get('release'))
+        if options.devel and 'devel' in versions:
+            print('Devel:    %s' % versions['devel'])
+
+        copy = partial(
+            dst_archive.copyPackage, from_archive=src_archive,
+            include_binaries=True, source_name=pkg,
+            version=versions['proposed'], auto_approve=True)
+
+        if options.devel:
+            if ('devel' not in versions or
+                versions['devel'] in (
+                    versions.get('updates', 'notexisting'),
+                    versions['release'])):
+                if not options.no_act:
+                    copy(to_pocket='Proposed', to_series=devel_series.name)
+                print('Version in %s matches development series, '
+                      'copied to %s-proposed' % (release, devel_series.name))
+            else:
+                print('ERROR: Version in %s does not match development '
+                      'series, not copying' % release)
+
+        if options.no_act:
+            if options.release:
+                print('Would copy to %s' % release)
+            else:
+                print('Would copy to %s-updates' % release)
+        else:
+            if options.release:
+                # -proposed -> release
+                copy(to_pocket='Release', to_series=release)
+                print('Copied to %s' % release)
+            else:
+                # -proposed -> -updates
+                # only phasing updates for >=raring to start
+                if (release not in ('lucid', 'precise') and
+                        package != 'linux' and
+                        not package.startswith('linux-') and
+                        not options.security):
+                    copy(to_pocket='Updates', to_series=release,
+                         phased_update_percentage=options.percentage)
+                else:
+                    copy(to_pocket='Updates', to_series=release)
+                print('Copied to %s-updates' % release)
+                if not options.no_bugs:
+                    sru_bugs = match_srubugs(options, versions['changesfile'])
+                    tag = 'verification-needed-%s' % release
+                    for sru_bug in sru_bugs:
+                        if tag not in sru_bug.tags:
+                            update_sru_bug(sru_bug, pkg)
+
+        # -proposed -> -security
+        if options.security:
+            if options.no_act:
+                print('Would copy to %s-security' % release)
+            else:
+                copy(to_pocket='Security', to_series=release)
+                print('Copied to %s-security' % release)
+
+
+if __name__ == '__main__':
+    if len(sys.argv) > 1 and sys.argv[1] == "run-tests":
+        sys.exit(unittest.main(argv=[sys.argv[0]] + sys.argv[2:]))
+
+    parser = optparse.OptionParser(
+        usage='usage: %prog [options] <release> <package> [<package> ...]')
+
+    parser.add_option(
+        '-l', '--launchpad', dest='launchpad_instance', default='production')
+    parser.add_option(
+        '--security', action='store_true', default=False,
+        help='Additionally copy to -security pocket')
+    parser.add_option(
+        '-d', '--devel', action='store_true', default=False,
+        help='Additionally copy to development release (only works if that '
+             'has the same version as <release>)')
+    parser.add_option(
+        '-r', '--release', action='store_true', default=False,
+        help='Copy to release pocket instead of -updates (useful for staging '
+             'uploads in development release)')
+    parser.add_option(
+        "-z", "--percentage", type="int", default=10,
+        metavar="PERCENTAGE", help="set phased update percentage")
+    parser.add_option(
+        '-n', '--no-act', action='store_true', default=False,
+        help='Only perform checks, but do not actually copy packages')
+    parser.add_option(
+        '-p', '--pattern', action='store_true', default=False,
+        help='Treat package names as patterns, not exact matches')
+    parser.add_option(
+        '--no-bugs', action='store_true', default=False,
+        help='Do not act on any bugs (helpful to avoid races).')
+    parser.add_option(
+        '--exclude-bug', action='append', default=[], metavar='BUG',
+        help='Do not update BUG.')
+    parser.add_option(
+        '-E', '--esm', action='store_true', default=False,
+        help='Copy from the kernel ESM proposed PPA to the ESM publication PPA')
+    parser.add_option(
+        '--skip-package-group-check', action='store_true', default=False,
+        help=('Skip the package set checks that require some packages '
+              'be released together'))
+
+    options, args = parser.parse_args()
+
+    if len(args) < 2:
+        parser.error(
+            'You must specify a release and source package(s), see --help')
+
+    if options.release and (options.security or options.devel):
+        parser.error('-r and -s/-d are mutually exclusive, see --help')
+
+    release = args.pop(0)
+    packages = args
+
+    if not options.skip_package_group_check:
+        try:
+            packages = check_package_sets(packages)
+        except ValueError as e:
+            sys.stderr.write(e.args[0] + '\n')
+            sys.exit(1)
+
+    launchpad = Launchpad.login_with(
+        'ubuntu-archive-tools', options.launchpad_instance, version='devel')
+    ubuntu = launchpad.distributions['ubuntu']
+    series = ubuntu.getSeries(name_or_version=release)
+    devel_series = ubuntu.current_series
+    if not devel_series:
+        sys.stderr.write(
+            'WARNING: No current development series, -d will not work\n')
+        devel_series = None
+    if release == 'precise':
+        sys.stdout.write(
+            'Called for precise; assuming kernel ESM publication\n')
+        options.esm = True
+
+    if options.esm:
+        # --security is meaningless for ESM everything is a security update.
+        options.security = False
+        options.release = True
+        src_archive = launchpad.archives.getByReference(
+            reference='~canonical-kernel-esm/ubuntu/proposed')
+        dst_archive = launchpad.archives.getByReference(
+            reference='~ubuntu-esm/ubuntu/esm')
+    else:
+        src_archive = dst_archive = ubuntu.getArchive(name='primary')
+
+    for package in packages:
+        release_package(options, package)

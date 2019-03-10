@@ -1,0 +1,113 @@
+#! /usr/bin/python
+
+# Copyright (C) 2013  Canonical Ltd.
+# Author: Colin Watson <cjwatson@ubuntu.com>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+"""Demote packages to proposed pocket.
+
+This is useful in the case where a package fails to build or is otherwise
+broken, but we don't want to remove it from the archive permanently and
+would be happy to take a fix by way of a sync from Debian or similar.  In
+cases where the package comes from Debian, make sure that any demotion to
+proposed is accompanied by a Debian bug report.
+
+This is analogous to removing a package from Debian testing.
+"""
+
+from __future__ import print_function
+
+from optparse import OptionParser
+import sys
+
+from launchpadlib.launchpad import Launchpad
+from ubuntutools.question import YesNoQuestion
+
+import lputils
+
+
+def demote(options, packages):
+    print("Demoting packages to %s-proposed:" % options.suite)
+    try:
+        demotables = []
+        for package in packages:
+            source = lputils.find_latest_published_source(options, package)
+            demotables.append(source)
+            print("\t%s" % source.display_name)
+    except lputils.PackageMissing as message:
+        print(message, ".  Exiting.")
+        sys.exit(1)
+    print("Comment: %s" % options.comment)
+
+    if options.dry_run:
+        print("Dry run; no packages demoted.")
+    else:
+        if not options.confirm_all:
+            if YesNoQuestion().ask("Demote", "no") == "no":
+                return
+
+        for source in demotables:
+            options.archive.copyPackage(
+                source_name=source.source_package_name,
+                version=source.source_package_version,
+                from_archive=options.archive,
+                from_series=options.series.name, from_pocket="Release",
+                to_series=options.series.name, to_pocket="Proposed",
+                include_binaries=True, auto_approve=True)
+            if not options.confirm_all:
+                if YesNoQuestion().ask(
+                        "Remove %s from release" % source.source_package_name,
+                        "no") == "no":
+                    continue
+            source.requestDeletion(removal_comment=options.comment)
+
+        print("%d %s successfully demoted." % (
+            len(demotables),
+            "package" if len(demotables) == 1 else "packages"))
+
+
+def main():
+    parser = OptionParser(
+        usage='usage: %prog -m "comment" [options] package [...]')
+    parser.add_option(
+        "-l", "--launchpad", dest="launchpad_instance", default="production")
+    parser.add_option(
+        "-n", "--dry-run", default=False, action="store_true",
+        help="only show demotions that would be performed")
+    parser.add_option(
+        "-y", "--confirm-all", default=False, action="store_true",
+        help="do not ask for confirmation")
+    parser.add_option(
+        "-d", "--distribution", default="ubuntu",
+        metavar="DISTRIBUTION", help="demote from DISTRIBUTION")
+    parser.add_option(
+        "-s", "--suite", metavar="SUITE", help="demote from SUITE")
+    parser.add_option(
+        "-e", "--version",
+        metavar="VERSION", help="package version (default: current version)")
+    parser.add_option("-m", "--comment", help="demotion comment")
+    options, args = parser.parse_args()
+
+    options.launchpad = Launchpad.login_with(
+        "demote-to-proposed", options.launchpad_instance, version="devel")
+    lputils.setup_location(options)
+
+    if options.comment is None:
+        parser.error("You must provide a comment/reason for all demotions.")
+
+    demote(options, args)
+
+
+if __name__ == '__main__':
+    main()

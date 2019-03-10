@@ -1,0 +1,167 @@
+#! /usr/bin/python
+
+# Copyright (C) 2009, 2010, 2011, 2012 Canonical Ltd.
+# Authors:
+#   Martin Pitt <martin.pitt@ubuntu.com>
+#   Colin Watson <cjwatson@ubuntu.com>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+"""Process binary NEW entries from Debian.
+
+Find and accept all binary NEW entries built by source packages synced
+directly from Debian.  These do not typically need significant review.
+"""
+
+from __future__ import print_function
+
+import atexit
+from optparse import OptionParser
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+try:
+    from urllib.parse import unquote, urlsplit
+    from urllib.request import urlopen, urlretrieve
+except ImportError:
+    from urllib import unquote, urlretrieve
+    from urllib2 import urlopen
+    from urlparse import urlsplit
+
+from launchpadlib.launchpad import Launchpad
+from ubuntutools.question import YesNoQuestion
+
+import lputils
+
+
+CONSUMER_KEY = "new-binary-debian-universe"
+
+
+temp_dir = None
+
+
+def ensure_temp_dir():
+    global temp_dir
+    if temp_dir is None:
+        temp_dir = tempfile.mkdtemp()
+        atexit.register(shutil.rmtree, temp_dir)
+
+
+def find_matching_uploads(options, explicit_suite):
+    kwargs = {}
+    if explicit_suite:
+        kwargs["pocket"] = options.pocket
+    uploads = options.series.getPackageUploads(
+        archive=options.archive, status="New", **kwargs)
+    for upload in uploads:
+        if upload.contains_build:
+            if upload.changes_file_url is None:
+                continue
+            # display_name is inaccurate for the theoretical case of an
+            # upload containing multiple builds, but in practice it's close
+            # enough.
+            source = upload.display_name.split(",")[0]
+            if source == "linux":
+                continue
+            binaries = upload.getBinaryProperties()
+            binaries = [b for b in binaries if "customformat" not in b]
+            if [b for b in binaries if "ubuntu" in b["version"]]:
+                continue
+            changes_file = urlopen(upload.changes_file_url)
+            try:
+                changes = changes_file.read()
+            finally:
+                changes_file.close()
+            if (" unstable; urgency=" not in changes and
+                    " experimental; urgency=" not in changes):
+                continue
+
+            if options.lintian:
+                ensure_temp_dir()
+                for url in upload.binaryFileUrls():
+                    if (not url.endswith("_all.deb") and
+                            not url.endswith("_i386.deb")):
+                        continue
+                    filename = unquote(urlsplit(url)[2].split("/")[-1])
+                    print("Fetching %s ..." % filename)
+                    path = os.path.join(temp_dir, filename)
+                    urlretrieve(url, path)
+                    lintian = subprocess.Popen(
+                        ["lintian", path], stdout=subprocess.PIPE,
+                        universal_newlines=True)
+                    out = lintian.communicate()[0]
+                    if lintian.returncode != 0:
+                        print("\n=== %s ===\n%s" % (filename, out),
+                              file=sys.stderr)
+
+            yield upload, binaries
+
+
+def find_and_accept(options, explicit_suite):
+    for upload, binaries in list(
+            find_matching_uploads(options, explicit_suite)):
+        if options.source and upload.package_name not in options.source:
+            continue
+        display = "%s/%s (%s)" % (
+            upload.display_name, upload.display_version, upload.display_arches)
+        if options.dry_run:
+            print("Would accept %s" % display)
+        else:
+            for binary in binaries:
+                if "customformat" not in binary:
+                    print("%s | %s Component: %s Section: %s Priority: %s" % (
+                        "N" if binary["is_new"] else "*", binary["name"],
+                        binary["component"], binary["section"],
+                        binary["priority"]))
+            if not options.confirm_all:
+                if YesNoQuestion().ask("Accept %s" % display, "no") == "no":
+                    continue
+            print("Accepting %s" % display)
+            upload.acceptFromQueue()
+
+
+def main():
+    parser = OptionParser(usage="usage: %prog [options]")
+    parser.add_option(
+        "-l", "--launchpad", dest="launchpad_instance", default="production")
+    parser.add_option(
+        "-d", "--distribution", metavar="DISTRO", default="ubuntu",
+        help="look in distribution DISTRO")
+    parser.add_option(
+        "-s", "--suite", metavar="SUITE", help="look in suite SUITE")
+    parser.add_option(
+        "-n", "--dry-run", default=False, action="store_true",
+        help="don't make any modifications")
+    parser.add_option(
+        "-y", "--confirm-all", default=False, action="store_true",
+        help="do not ask for confirmation")
+    parser.add_option(
+        "--lintian", default=False, action="store_true",
+        help="run packages through Lintian")
+    parser.add_option(
+        "--source", action="append", metavar="NAME",
+        help="only consider source package NAME")
+    options, _ = parser.parse_args()
+
+    options.launchpad = Launchpad.login_with(
+        CONSUMER_KEY, options.launchpad_instance, version="devel")
+    explicit_suite = options.suite is not None
+    lputils.setup_location(options)
+
+    find_and_accept(options, explicit_suite)
+
+
+if __name__ == '__main__':
+    main()

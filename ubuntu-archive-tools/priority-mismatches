@@ -1,0 +1,338 @@
+#!/usr/bin/env python
+
+# Synchronise package priorities with germinate output
+# Copyright (C) 2005, 2009, 2010, 2011, 2012  Canonical Ltd.
+# Author: Colin Watson <cjwatson@ubuntu.com>
+
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+
+# <vorlon> elmo: grip_3.2.0-5/sparc seems to have gone missing, marked as
+#          Uploaded 2 1/2 hours ago and nowhere to be found on newraff
+# <elmo> uh?
+# <elmo>       grip |    3.2.0-5 |      unstable | source, alpha, arm, hppa,
+#        i386, ia64, m68k, mips, mipsel, powerpc, s390, sparc
+# <elmo> I hid it in the pool, being the cunning cabalist that I am
+
+from __future__ import print_function
+
+import atexit
+from collections import defaultdict
+import csv
+import gzip
+try:
+    from html import escape
+except ImportError:
+    from cgi import escape
+from optparse import OptionParser
+import os
+import re
+import shutil
+import sys
+import tempfile
+from textwrap import dedent
+import time
+
+import apt_pkg
+from launchpadlib.launchpad import Launchpad
+
+from charts import make_chart, make_chart_header
+
+
+tempdir = None
+
+# XXX unhardcode, or maybe adjust seeds?
+# These packages are not really to be installed by debootstrap, despite
+# germinate saying so
+re_not_base = re.compile(r"^(linux-(image|restricted|386|generic|server|power|"
+                         "cell|imx51).*|nvidia-kernel-common|grub|yaboot)$")
+
+# tuples of (package, desired_priority, architecture) which are known to not
+# be fixable and should be ignored; in particular we cannot set per-arch
+# priorities
+ignore = [
+    ('hfsutils', 'standard', 'powerpc'),  # optional on all other arches
+    ('bc', 'important', 'powerpc'),  # needed for powerpc-ibm-utils
+    ('bc', 'important', 'ppc64el'),  # needed for powerpc-ibm-utils
+    ('libsgutils2-2', 'standard', 'powerpc'),  # needed for lsvpd
+    ('libsgutils2-2', 'standard', 'ppc64el'),  # needed for lsvpd
+    ('libdrm-intel1', 'required', 'amd64'),  # needed for plymouth only on x86
+    ('libdrm-intel1', 'required', 'i386'),  # needed for plymouth only on x86
+    ('libelf1', 'optional', 'arm64'),  # ltrace not built on arm64
+    ('libpciaccess0', 'required', 'amd64'),  # needed for plymouth only on x86
+    ('libpciaccess0', 'required', 'i386'),  # needed for plymouth only on x86
+    ('libnuma1', 'optional', 's390x'), # standard on all other arches
+    ('libnuma1', 'optional', 'armhf'), # standard on all other arches
+    ('libunwind8','standard','amd64'), # wanted by strace on only amd64
+    ('multiarch-support','optional','s390x'), # eventually, all arches will downgrade
+]
+
+
+def ensure_tempdir():
+    global tempdir
+    if not tempdir:
+        tempdir = tempfile.mkdtemp(prefix='priority-mismatches')
+        atexit.register(shutil.rmtree, tempdir)
+
+
+def decompress_open(tagfile):
+    ensure_tempdir()
+    decompressed = tempfile.mktemp(dir=tempdir)
+    fin = gzip.GzipFile(filename=tagfile)
+    with open(decompressed, 'wb') as fout:
+        fout.write(fin.read())
+    return open(decompressed, 'r')
+
+
+# XXX partial code duplication from component-mismatches
+def read_germinate(suite, arch, seed):
+    local_germinate = os.path.expanduser('~/mirror/ubuntu-germinate')
+    # XXX hardcoding
+    filename = "%s_ubuntu_%s_%s" % (seed, suite, arch)
+    pkgs = {}
+
+    f = open(local_germinate + '/' + filename)
+    for line in f:
+        # Skip header and footer
+        if line[0] == "-" or line.startswith("Package") or line[0] == " ":
+            continue
+        # Skip empty lines
+        line = line.strip()
+        if not line:
+            continue
+        pkgs[line.split('|', 1)[0].strip()] = None
+    f.close()
+
+    return pkgs
+
+
+def process(options, arch):
+    suite = options.suite
+    components = options.component.split(',')
+
+    archive = os.path.expanduser('~/mirror/ubuntu/')
+
+    if suite in ("warty", "hoary"):
+        required_seed = None
+        important_seed = "base"
+        standard_seed = None
+    elif suite in ("breezy", "dapper", "edgy", "feisty"):
+        required_seed = None
+        important_seed = "minimal"
+        standard_seed = "standard"
+    else:
+        required_seed = "required"
+        important_seed = "minimal"
+        standard_seed = "standard"
+
+    if required_seed is not None:
+        required_pkgs = read_germinate(suite, arch, required_seed)
+        required_pkgs = [
+            pkg for pkg in required_pkgs if not re_not_base.match(pkg)]
+    important_pkgs = read_germinate(suite, arch, important_seed)
+    important_pkgs = [
+        pkg for pkg in important_pkgs if not re_not_base.match(pkg)]
+    if standard_seed is not None:
+        standard_pkgs = read_germinate(suite, arch, standard_seed).keys()
+    required_pkgs.sort()
+    important_pkgs.sort()
+    standard_pkgs.sort()
+
+    original = {}
+    for component in components:
+        binaries_path = "%s/dists/%s/%s/binary-%s/Packages.gz" % (
+            archive, suite, component, arch)
+        for section in apt_pkg.TagFile(decompress_open(binaries_path)):
+            if 'Package' in section and 'Priority' in section:
+                (pkg, priority) = (section['Package'], section['Priority'])
+                original[pkg] = priority
+
+    packages = sorted(original)
+
+    # XXX hardcoding, but who cares really
+    priorities = {'required': 1, 'important': 2, 'standard': 3,
+                  'optional': 4, 'extra': 5, 'source': 99}
+
+    # If there is a required seed:
+    #   Force everything in the required seed to >= required.
+    #   Force everything not in the required seed to < required.
+    # Force everything in the important seed to >= important.
+    # Force everything not in the important seed to < important.
+    # (This allows debootstrap to determine the base system automatically.)
+    # If there is a standard seed:
+    #   Force everything in the standard seed to >= standard.
+    #   Force everything not in the standard seed to < standard.
+
+    changed = defaultdict(lambda: defaultdict(list))
+
+    for pkg in packages:
+        priority = original[pkg]
+
+        if required_seed is not None and pkg in required_pkgs:
+            if priorities[priority] > priorities["required"]:
+                priority = "required"
+        elif pkg in important_pkgs:
+            if (required_seed is not None and
+                    priorities[priority] < priorities["important"]):
+                priority = "important"
+            elif priorities[priority] > priorities["important"]:
+                priority = "important"
+        else:
+            # XXX assumes important and standard are adjacent
+            if priorities[priority] < priorities["standard"]:
+                priority = "standard"
+
+            if standard_seed is not None:
+                if pkg in standard_pkgs:
+                    if priorities[priority] > priorities["standard"]:
+                        priority = "standard"
+                else:
+                    # XXX assumes standard and optional are adjacent
+                    if priorities[priority] < priorities["optional"]:
+                        priority = "optional"
+
+        if priority != original[pkg] and (pkg, priority, arch) not in ignore:
+            changed[original[pkg]][priority].append(pkg)
+
+    changes =0
+    oldprios = sorted(changed, key=lambda x: priorities[x])
+    for oldprio in oldprios:
+        newprios = sorted(changed[oldprio], key=lambda x: priorities[x])
+        for newprio in newprios:
+            changes += len(changed[oldprio][newprio])
+            header = ("Packages to change from priority %s to %s" %
+                      (oldprio, newprio))
+            print(header)
+            print("-" * len(header))
+            for pkg in changed[oldprio][newprio]:
+                print("%s" % pkg)
+            print()
+            if options.html_output is not None:
+                print("<h3>%s</h3>" % escape(header), file=options.html_output)
+                print("<ul>", file=options.html_output)
+                for pkg in changed[oldprio][newprio]:
+                    print(
+                        "<li>%s</li>" % escape(pkg), file=options.html_output)
+                print("</ul>", file=options.html_output)
+
+    return changes
+
+
+def main():
+    parser = OptionParser(
+        description='Synchronise package priorities with germinate output.')
+    parser.add_option(
+        "-l", "--launchpad", dest="launchpad_instance", default="production")
+    parser.add_option('-o', '--output-file', help='output to this file')
+    parser.add_option('--html-output-file', help='output HTML to this file')
+    parser.add_option(
+        '--csv-file', help='record CSV time series data in this file')
+    parser.add_option('-a', '--architecture',
+                      help='look at germinate output for this architecture')
+    parser.add_option('-c', '--component',
+                      default='main,restricted,universe,multiverse',
+                      help='set overrides by component')
+    parser.add_option('-s', '--suite', help='set overrides by suite')
+    options, args = parser.parse_args()
+
+    if options.suite is None:
+        launchpad = Launchpad.login_anonymously('priority-mismatches',
+                                                options.launchpad_instance)
+        options.suite = launchpad.distributions['ubuntu'].current_series.name
+
+    if options.output_file is not None:
+        sys.stdout = open('%s.new' % options.output_file, 'w')
+    if options.html_output_file is not None:
+        options.html_output = open('%s.new' % options.html_output_file, 'w')
+    else:
+        options.html_output = None
+
+    options.time = time.time()
+    options.timestamp = time.strftime(
+        '%a %b %e %H:%M:%S %Z %Y', time.gmtime(options.time))
+    print('Generated: %s' % options.timestamp)
+    print()
+
+    if options.html_output is not None:
+        print(dedent("""\
+            <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN"
+             "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+            <html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
+            <head>
+              <meta http-equiv="Content-Type"
+                    content="text/html; charset=utf-8" />
+              <title>Priority mismatches for %s</title>
+              <style type="text/css">
+                body { background: #CCCCB0; color: black; }
+              </style>
+              %s
+            </head>
+            <body>
+            <h1>Priority mismatches for %s</h1>
+            """) % (
+                escape(options.suite), make_chart_header(),
+                escape(options.suite)),
+            file=options.html_output)
+
+    changes = 0
+    if options.architecture is None:
+        for arch in ('amd64', 'arm64', 'armhf', 'i386', 'ppc64el', 's390x'):
+            print(arch)
+            print('=' * len(arch))
+            print()
+            if options.html_output is not None:
+                print("<h2>%s</h2>" % escape(arch), file=options.html_output)
+            changes += process(options, arch)
+    else:
+        changes += process(options, options.architecture)
+
+    if options.html_output_file is not None:
+        print("<h2>Over time</h2>", file=options.html_output)
+        print(
+            make_chart("priority-mismatches.csv", ["changes"]),
+            file=options.html_output)
+        print(
+            "<p><small>Generated: %s</small></p>" % escape(options.timestamp),
+            file=options.html_output)
+        print("</body></html>", file=options.html_output)
+        options.html_output.close()
+        os.rename(
+            '%s.new' % options.html_output_file, options.html_output_file)
+    if options.output_file is not None:
+        sys.stdout.close()
+        os.rename('%s.new' % options.output_file, options.output_file)
+    if options.csv_file is not None:
+        if sys.version < "3":
+            open_mode = "ab"
+            open_kwargs = {}
+        else:
+            open_mode = "a"
+            open_kwargs = {"newline": ""}
+        csv_is_new = not os.path.exists(options.csv_file)
+        with open(options.csv_file, open_mode, **open_kwargs) as csv_file:
+            # Field names deliberately hardcoded; any changes require
+            # manually rewriting the output file.
+            fieldnames = [
+                "time",
+                "changes",
+                ]
+            csv_writer = csv.DictWriter(csv_file, fieldnames)
+            if csv_is_new:
+                csv_writer.writeheader()
+            csv_writer.writerow(
+                {"time": int(options.time * 1000), "changes": changes})
+
+
+if __name__ == '__main__':
+    main()

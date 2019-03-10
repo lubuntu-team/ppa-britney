@@ -1,0 +1,272 @@
+#!/usr/bin/env python
+
+# Check for override mismatches between architectures
+# Copyright (C) 2005, 2008, 2009, 2010, 2011, 2012  Canonical Ltd.
+# Author: Colin Watson <cjwatson@ubuntu.com>
+
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+
+from __future__ import print_function
+
+import atexit
+from collections import defaultdict
+import csv
+import gzip
+try:
+    from html import escape
+except ImportError:
+    from cgi import escape
+from optparse import OptionParser
+import os
+import shutil
+import sys
+import tempfile
+from textwrap import dedent
+import time
+
+import apt_pkg
+from launchpadlib.launchpad import Launchpad
+
+from charts import make_chart, make_chart_header
+
+
+tempdir = None
+
+
+def ensure_tempdir():
+    global tempdir
+    if not tempdir:
+        tempdir = tempfile.mkdtemp(prefix='architecture-mismatches')
+        atexit.register(shutil.rmtree, tempdir)
+
+
+def decompress_open(tagfile):
+    ensure_tempdir()
+    decompressed = tempfile.mktemp(dir=tempdir)
+    fin = gzip.GzipFile(filename=tagfile)
+    with open(decompressed, 'wb') as fout:
+        fout.write(fin.read())
+    return open(decompressed, 'r')
+
+
+def print_section(options, header, items):
+    print("%s:" % header)
+    print("-" * (len(header) + 1))
+    print()
+    for item in items:
+        print(item)
+    print()
+
+    if options.html_output is not None:
+        print("<h2>%s</h2>" % escape(header), file=options.html_output)
+        print("<ul>", file=options.html_output)
+        for item in items:
+            print("<li>%s</li>" % escape(item), file=options.html_output)
+        print("</ul>", file=options.html_output)
+
+
+def process(options, suite, components, arches):
+    results = {}
+    results["time"] = int(options.time * 1000)
+
+    archive = os.path.expanduser('~/mirror/ubuntu/')
+
+    pkgcomp = defaultdict(lambda: defaultdict(list))
+    pkgsect = defaultdict(lambda: defaultdict(list))
+    pkgprio = defaultdict(lambda: defaultdict(list))
+    archall = defaultdict(set)
+    archany = set()
+    for component in components:
+        for arch in arches:
+            for suffix in '', '/debian-installer':
+                binaries_path = "%s/dists/%s/%s%s/binary-%s/Packages.gz" % (
+                    archive, suite, component, suffix, arch)
+                for section in apt_pkg.TagFile(decompress_open(binaries_path)):
+                    if 'Package' in section:
+                        pkg = section['Package']
+                        pkgcomp[pkg][component].append(arch)
+                        if 'Section' in section:
+                            pkgsect[pkg][section['Section']].append(arch)
+                        if 'Priority' in section:
+                            pkgprio[pkg][section['Priority']].append(arch)
+                        if 'Architecture' in section:
+                            if section['Architecture'] == 'all':
+                                archall[pkg].add(arch)
+                            else:
+                                archany.add(pkg)
+
+    packages = sorted(pkgcomp)
+
+    items = []
+    for pkg in packages:
+        if len(pkgcomp[pkg]) > 1:
+            out = []
+            for component in sorted(pkgcomp[pkg]):
+                out.append("%s [%s]" %
+                           (component,
+                            ' '.join(sorted(pkgcomp[pkg][component]))))
+            items.append("%s: %s" % (pkg, ' '.join(out)))
+    print_section(
+        options, "Packages with inconsistent components between architectures",
+        items)
+    results["inconsistent components"] = len(items)
+
+    items = []
+    for pkg in packages:
+        if pkg in pkgsect and len(pkgsect[pkg]) > 1:
+            out = []
+            for section in sorted(pkgsect[pkg]):
+                out.append("%s [%s]" %
+                           (section,
+                            ' '.join(sorted(pkgsect[pkg][section]))))
+            items.append("%s: %s" % (pkg, ' '.join(out)))
+    print_section(
+        options, "Packages with inconsistent sections between architectures",
+        items)
+    results["inconsistent sections"] = len(items)
+
+    items = []
+    for pkg in packages:
+        if pkg in pkgprio and len(pkgprio[pkg]) > 1:
+            out = []
+            for priority in sorted(pkgprio[pkg]):
+                out.append("%s [%s]" %
+                           (priority,
+                            ' '.join(sorted(pkgprio[pkg][priority]))))
+            items.append("%s: %s" % (pkg, ' '.join(out)))
+    print_section(
+        options, "Packages with inconsistent priorities between architectures",
+        items)
+    results["inconsistent priorities"] = len(items)
+
+    items = []
+    archesset = set(arches)
+    for pkg in packages:
+        if (pkg not in archany and
+                pkg in archall and len(archall[pkg]) < len(arches)):
+            missing = sorted(archesset - archall[pkg])
+            items.append("%s [%s]" % (pkg, ' '.join(missing)))
+    print_section(
+        options,
+        "Architecture-independent packages missing from some architectures",
+        items)
+    results["missing arch-indep"] = len(items)
+
+    return results
+
+
+def main():
+    parser = OptionParser(
+        description='Check for override mismatches between architectures.')
+    parser.add_option(
+        "-l", "--launchpad", dest="launchpad_instance", default="production")
+    parser.add_option('-o', '--output-file', help='output to this file')
+    parser.add_option('--html-output-file', help='output HTML to this file')
+    parser.add_option(
+        '--csv-file', help='record CSV time series data in this file')
+    parser.add_option('-s', '--suite', help='check this suite')
+    options, args = parser.parse_args()
+
+    if options.suite is None:
+        launchpad = Launchpad.login_anonymously(
+            'architecture-mismatches', options.launchpad_instance)
+        options.suite = launchpad.distributions['ubuntu'].current_series.name
+
+    suite = options.suite
+    components = ["main", "restricted", "universe", "multiverse"]
+    arches = ["amd64", "arm64", "armhf", "i386", "ppc64el", "s390x"]
+
+    if options.output_file is not None:
+        sys.stdout = open('%s.new' % options.output_file, 'w')
+    if options.html_output_file is not None:
+        options.html_output = open('%s.new' % options.html_output_file, 'w')
+    else:
+        options.html_output = None
+
+    options.time = time.time()
+    options.timestamp = time.strftime(
+        '%a %b %e %H:%M:%S %Z %Y', time.gmtime(options.time))
+    print('Generated: %s' % options.timestamp)
+    print()
+
+    if options.html_output is not None:
+        print(dedent("""\
+            <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN"
+             "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+            <html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
+            <head>
+              <meta http-equiv="Content-Type"
+                    content="text/html; charset=utf-8" />
+              <title>Architecture mismatches for %s</title>
+              <style type="text/css">
+                body { background: #CCCCB0; color: black; }
+              </style>
+              %s
+            </head>
+            <body>
+            <h1>Architecture mismatches for %s</h1>
+            """) % (
+                escape(options.suite), make_chart_header(),
+                escape(options.suite)),
+            file=options.html_output)
+
+    results = process(options, suite, components, arches)
+
+    if options.html_output_file is not None:
+        print("<h2>Over time</h2>", file=options.html_output)
+        print(
+            make_chart("architecture-mismatches.csv", [
+                "inconsistent components",
+                "inconsistent sections",
+                "inconsistent priorities",
+                "missing arch-indep",
+                ]),
+            file=options.html_output)
+        print(
+            "<p><small>Generated: %s</small></p>" % escape(options.timestamp),
+            file=options.html_output)
+        print("</body></html>", file=options.html_output)
+        options.html_output.close()
+        os.rename(
+            '%s.new' % options.html_output_file, options.html_output_file)
+    if options.output_file is not None:
+        sys.stdout.close()
+        os.rename('%s.new' % options.output_file, options.output_file)
+    if options.csv_file is not None:
+        if sys.version < "3":
+            open_mode = "ab"
+            open_kwargs = {}
+        else:
+            open_mode = "a"
+            open_kwargs = {"newline": ""}
+        csv_is_new = not os.path.exists(options.csv_file)
+        with open(options.csv_file, open_mode, **open_kwargs) as csv_file:
+            # Field names deliberately hardcoded; any changes require
+            # manually rewriting the output file.
+            fieldnames = [
+                "time",
+                "inconsistent components",
+                "inconsistent sections",
+                "inconsistent priorities",
+                "missing arch-indep",
+                ]
+            csv_writer = csv.DictWriter(csv_file, fieldnames)
+            if csv_is_new:
+                csv_writer.writeheader()
+            csv_writer.writerow(results)
+
+
+if __name__ == '__main__':
+    main()

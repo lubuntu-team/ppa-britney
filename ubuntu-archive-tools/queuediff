@@ -1,0 +1,258 @@
+#!/usr/bin/python
+
+# Copyright (C) 2009, 2010, 2011, 2012  Canonical Ltd.
+# Copyright (C) 2010  Scott Kitterman <scott@kitterman.com>
+# Author: Martin Pitt <martin.pitt@canonical.com>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+'''Show changes in an unapproved upload.
+
+Generate a debdiff between current source package in a given release and the
+version in the unapproved queue.
+
+USAGE:
+    queuediff -s hardy -b hal | view -
+'''
+
+from __future__ import print_function
+
+import gzip
+import optparse
+import re
+import sys
+try:
+    from urllib.parse import quote
+    from urllib.request import urlopen, urlretrieve
+except ImportError:
+    from urllib import quote, urlopen, urlretrieve
+import webbrowser
+
+from launchpadlib.launchpad import Launchpad
+
+
+default_release = 'cosmic'
+
+lp = None
+
+queue_url = 'https://launchpad.net/ubuntu/%s/+queue?queue_state=1&batch=300'
+ppa_url = ('https://launchpad.net/~%s/+archive/ubuntu/%s/+packages?'
+           'field.series_filter=%s')
+
+
+def parse_options():
+    '''Parse command line arguments.
+
+    Return (options, source_package) tuple.
+    '''
+    parser = optparse.OptionParser(
+        usage='Usage: %prog [options] source_package')
+    parser.add_option(
+        "-l", "--launchpad", dest="launchpad_instance", default="production")
+    parser.add_option(
+        "-s", dest="release", default=default_release, metavar="RELEASE",
+        help="release (default: %s)" % default_release)
+    parser.add_option(
+        "-p", dest="ppa", metavar="LP_USER/PPA_NAME",
+        help="Check a PPA instead of the Ubuntu unapproved queue")
+    parser.add_option(
+        "-b", "--browser", dest="browser", action="store_true",
+        default=False, help="Open Launchpad bugs in browser")
+
+    (opts, args) = parser.parse_args()
+
+    if len(args) != 1:
+        parser.error('Need to specify one source package name')
+
+    return (opts, args[0])
+
+
+def parse_changes(changes_url):
+    '''Parse .changes file.
+
+    Return dictionary with interesting information: 'bugs' (list),
+    'distribution'.
+    '''
+    info = {'bugs': []}
+    for l in urlopen(changes_url):
+        if l.startswith('Distribution:'):
+            info['distribution'] = l.split()[1]
+        if l.startswith('Launchpad-Bugs-Fixed:'):
+            info['bugs'] = sorted(set(l.split()[1:]))
+        if l.startswith('Version:'):
+            info['version'] = l.split()[1]
+    return info
+
+
+def from_queue(sourcepkg, release):
+    '''Get .changes and debdiff from queue page.
+
+    Return (changes URL, debdiff URL) pair.
+    '''
+    oops_re = re.compile('class="oopsid">(OOPS[a-zA-Z0-9-]+)<')
+    changes_re = re.compile(
+        'href="(http://launchpadlibrarian.net/\d+/%s_[^"]+_source.changes)"' %
+        re.escape(quote(sourcepkg)))
+    debdiff_re = re.compile(
+        'href="(http://launchpadlibrarian.net/'
+        '\d+/%s_[^"_]+_[^_"]+\.diff\.gz)">\s*diff from' %
+        re.escape(quote(sourcepkg)))
+
+    queue_html = urlopen(queue_url % release).read()
+
+    m = oops_re.search(queue_html)
+    if m:
+        print('ERROR: Launchpad failure:', m.group(1), file=sys.stderr)
+        sys.exit(1)
+
+    changes_url = None
+    for m in changes_re.finditer(queue_html):
+        # ensure that there's only one upload
+        if changes_url:
+            print('ERROR: Queue has more than one upload of this source, '
+                  'please handle manually', file=sys.stderr)
+            sys.exit(1)
+        changes_url = m.group(1)
+    #print('changes URL:', changes_url, file=sys.stderr)
+
+    m = debdiff_re.search(queue_html)
+    if not m:
+        print('ERROR: queue does not have a debdiff', file=sys.stderr)
+        sys.exit(1)
+    debdiff_url = m.group(1)
+    #print('debdiff URL:', debdiff_url, file=sys.stderr)
+
+    return (changes_url, debdiff_url)
+
+
+def from_ppa(sourcepkg, release, user, ppaname):
+    '''Get .changes and debdiff from a PPA.
+
+    Return (changes URL, debdiff URL) pair.
+    '''
+    changes_re = re.compile(
+        'href="(https://launchpad.net/[^ "]+/%s_[^"]+_source.changes)"' %
+        re.escape(quote(sourcepkg)))
+    sourcepub_re = re.compile(
+        'href="(\+sourcepub/\d+/\+listing-archive-extra)"')
+    #debdiff_re = re.compile(
+    #    'href="(https://launchpad.net/.[^ "]+.diff.gz)">diff from')
+
+    changes_url = None
+    changes_sourcepub = None
+    last_sourcepub = None
+
+    for line in urlopen(ppa_url % (user, ppaname, release)):
+        m = sourcepub_re.search(line)
+        if m:
+            last_sourcepub = m.group(1)
+            continue
+        m = changes_re.search(line)
+        if m:
+            # ensure that there's only one upload
+            if changes_url:
+                print('ERROR: PPA has more than one upload of this source, '
+                      'please handle manually', file=sys.stderr)
+                sys.exit(1)
+            changes_url = m.group(1)
+            assert changes_sourcepub is None, (
+                'got two sourcepubs before .changes')
+            changes_sourcepub = last_sourcepub
+
+    #print('changes URL:', changes_url, file=sys.stderr)
+
+    # the code below works, but the debdiffs generated by Launchpad are rather
+    # useless, as they are against the final version, not what is in
+    # -updates/-security; so disable
+
+    ## now open the sourcepub and get the URL for the debdiff
+    #changes_sourcepub = changes_url.rsplit('+', 1)[0] + changes_sourcepub
+    ##print('sourcepub URL:', changes_sourcepub, file=sys.stderr)
+    #sourcepub_html = urlopen(changes_sourcepub).read()
+
+    #m = debdiff_re.search(sourcepub_html)
+    #if not m:
+    #    print('ERROR: PPA does not have a debdiff', file=sys.stderr)
+    #    sys.exit(1)
+    #debdiff_url = m.group(1)
+    ##print('debdiff URL:', debdiff_url, file=sys.stderr)
+    debdiff_url = None
+
+    return (changes_url, debdiff_url)
+#
+# main
+#
+
+
+(opts, sourcepkg) = parse_options()
+
+if opts.ppa:
+    (user, ppaname) = opts.ppa.split('/', 1)
+    (changes_url, debdiff_url) = from_ppa(
+        sourcepkg, opts.release, user, ppaname)
+else:
+    (changes_url, debdiff_url) = from_queue(sourcepkg, opts.release)
+
+# print diff
+if debdiff_url:
+    print(gzip.open(urlretrieve(debdiff_url)[0]).read())
+else:
+    print('No debdiff available')
+
+# parse changes and open bugs
+changes = parse_changes(changes_url)
+
+if opts.browser:
+    for b in changes['bugs']:
+        webbrowser.open('https://bugs.launchpad.net/bugs/' + b)
+
+# print matching sru-accept command
+if changes['bugs']:
+    # Check for existing version in proposed
+    lp = Launchpad.login_anonymously('queuediff', opts.launchpad_instance)
+    ubuntu = lp.distributions['ubuntu']
+    series = ubuntu.getSeries(name_or_version=opts.release)
+    if series != ubuntu.current_series:
+        archive = ubuntu.main_archive
+        existing = [
+            pkg.source_package_version for pkg in archive.getPublishedSources(
+                exact_match=True, distro_series=series, pocket='Proposed',
+                source_name=sourcepkg, status='Published')]
+        updates = [
+            pkg.source_package_version for pkg in archive.getPublishedSources(
+                exact_match=True, distro_series=series, pocket='Updates',
+                source_name=sourcepkg, status='Published')]
+        for pkg in existing:
+            if pkg not in updates:
+                msg = '''\
+*******************************************************
+*
+* WARNING: %s already published in Proposed (%s)
+*
+*******************************************************''' % (sourcepkg, pkg)
+                # show it in the diff as well as in the terminal
+                print(msg)
+                print(msg, file=sys.stderr)
+
+        print('''After accepting this SRU from the queue, run:
+  sru-accept -v %s -s %s -p %s %s''' %
+              (changes['version'], changes['distribution'].split('-')[0],
+               sourcepkg, ' '.join(changes['bugs'])), file=sys.stderr)
+
+# for PPAs, print matching copy command
+if opts.ppa:
+    print('\nTo copy from PPA to distribution, run:\n'
+          '  copy-package -b --from=~%s/ubuntu/%s -s %s --to=ubuntu '
+          '--to-suite %s-proposed -y %s\n' %
+          (user, ppaname, opts.release, opts.release, sourcepkg),
+          file=sys.stderr)

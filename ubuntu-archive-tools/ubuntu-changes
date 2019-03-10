@@ -1,0 +1,65 @@
+#! /bin/sh
+
+# Copyright (C) 2009, 2010, 2011, 2012  Canonical Ltd.
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+DIST="${DIST:-disco}"
+
+MADISON="$(rmadison -a source -s "$DIST" "$1")"
+[ "$MADISON" ] || exit 1
+
+VER="$(echo "$MADISON" | cut -d'|' -f2 | tr -d ' ' | sed -r 's/^[0-9]+://')"
+SECTION="$(echo "$MADISON" | cut -d'|' -f3 | tr -d ' ')"
+case $SECTION in
+	$DIST)
+		SECTION=main
+		;;
+	$DIST/*)
+		SECTION="${SECTION#$DIST/}"
+		;;
+esac
+case $1 in
+	lib?*)
+		POOLINDEX="$(echo "$1" | cut -c 1-4)"
+		;;
+	*)
+		POOLINDEX="$(echo "$1" | cut -c 1)"
+		;;
+esac
+
+NL='
+'
+OLDIFS="$IFS"
+IFS="$NL"
+wget -q -O- http://changelogs.ubuntu.com/changelogs/pool/$SECTION/$POOLINDEX/$1/${1}_$VER/changelog | while read -r line; do
+	IFS="$OLDIFS"
+	case $line in
+		[A-Za-z0-9]*)
+			# changelog entry header
+			target="$(echo "$line" | cut -d' ' -f3)"
+			target="${target%;}"
+			target="${target%%-*}"
+			case $target in
+				warty|hoary|breezy|dapper|edgy|feisty|gutsy|hardy|intrepid|jaunty|karmic|lucid|maverick|natty|oneiric|precise|quantal|raring|saucy|trusty|utopic|vivid|wily|xenial|yakkety|zesty|artful|bionic|cosmic|disco|devel)
+					;;
+				*)
+					exit 0
+					;;
+			esac
+			;;
+	esac
+	echo "$line"
+	IFS="$NL"
+done
+IFS="$OLDIFS"

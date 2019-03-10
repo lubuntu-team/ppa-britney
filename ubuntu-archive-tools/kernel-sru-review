@@ -1,0 +1,455 @@
+#!/usr/bin/python3
+
+# Copyright (C) 2016  Canonical Ltd.
+# Author: Steve Langasek <steve.langasek@canonical.com>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+"""Show and approve changes in an unapproved kernel upload.
+
+Generate a debdiff between current source package in a given release and the
+version in the canonical-kernel ppa, and ask whether or not to approve the
+upload.
+
+The debdiff is filtered for noise (abi/* directories; mechanical changes of
+ABI strings in debian/control et al.)
+
+USAGE:
+    kernel-sru-review <bug number>
+"""
+
+import glob
+import datetime
+import os
+import pytz
+import re
+import shutil
+import subprocess
+import sys
+import time
+from contextlib import ExitStack
+from tempfile import mkdtemp
+from optparse import OptionParser
+
+from launchpadlib.launchpad import Launchpad
+from kernel_workflow import *
+
+
+def get_master_kernel(lp, bugnum):
+    current = lp.bugs[bugnum]
+    master = None
+    backport_re = re.compile(r'^kernel-sru-backport-of-(\d+)$')
+    derivative_re = re.compile(r'^kernel-sru-derivative-of-(\d+)$')
+
+    for tag in current.tags:
+        num = derivative_re.match(tag)
+        if not num:
+            num = backport_re.match(tag)
+        if num:
+            master = lp.bugs[num.group(1)]
+
+    if not master:
+        print("No master kernel.")
+        return (None, None)
+    return get_name_and_version_from_bug(master)
+
+
+def get_kernel_dsc(me, archive, source, series=None, version=None):
+    kwargs = {
+        'order_by_date': True,
+        'exact_match': True,
+        'source_name': source
+    }
+    if version:
+        kwargs['version'] = version
+    if series:
+        kwargs['status'] = 'Published'
+        kwargs['distro_series'] = series
+
+    # in cases where we have a separate archive for proposed and release,
+    # we need to check both places in the order proposed -> release
+    target = archive['proposed']
+    srcpkgs = target.getPublishedSources(**kwargs)
+    if len(srcpkgs) == 0:
+        target = archive['release']
+        srcpkgs = target.getPublishedSources(**kwargs)
+        if len(srcpkgs) == 0 and 'non-esm' in archive:
+            target = archive['non-esm']
+            srcpkgs = target.getPublishedSources(**kwargs)
+    if len(srcpkgs) == 0:
+        raise KernelWorkflowError(
+            "Selected %s kernel could not be found" % source)
+    srcpkg = srcpkgs[0]
+    source_ver = srcpkg.source_package_version
+    source_dsc = list(filter(
+                         lambda x: x.endswith('.dsc'),
+                         srcpkg.sourceFileUrls()))[0]
+    if target.private:
+        priv_url = me.getArchiveSubscriptionURL(archive=target)
+        dsc_file = os.path.basename(source_dsc)
+        source_dsc = os.path.join(priv_url, 'pool/main/l', source, dsc_file)
+
+    return (source_dsc, source_ver)
+
+
+def generate_diff_from_master(me, archive, master_source, master_version,
+                              new_source, new_upstream,
+                              work_dir, tardir, start_dir):
+    master_upstream = master_version.split('-')[0]
+
+    try:
+        master_dsc, master_version = get_kernel_dsc(
+            me, archive, master_source, version=master_version)
+    except KernelWorkflowError:
+        print("A master kernel diff was requested but the listed master "
+              "kernel could not be found in any known archive.",
+              end="")
+        sys.stdout.flush()
+        sys.stdin.readline()
+        return
+
+    fetch_tarball_from_cache(
+        work_dir, tardir, master_source, master_upstream, start_dir)
+
+    # grab the old source first
+    dget_cmd = ['dget', '-u', master_dsc]
+    try:
+        subprocess.check_call(dget_cmd)
+    except subprocess.CalledProcessError as e:
+        print("Failed to get master source for %s at version %s" %
+              (master_source, master_version))
+        raise e
+
+    # generate the diff
+    print("Generating brief diff between new kernel and master (%s) to %s" %
+          (master_version, os.path.join(work_dir, 'master_diff')))
+    diff_cmd = ('diff -rq "{}-{}" "{}-{}" >master_diff').format(
+        master_source, master_upstream, new_source, new_upstream)
+    subprocess.call(diff_cmd, shell=True)
+
+
+def review_task_callback(lp, bugnum, task, context):
+    if str(task.target) != \
+       ('%skernel-sru-workflow/promote-to-proposed' % str(lp._root_uri)):
+        return {}
+    if task.status == 'Confirmed':
+        return {'proposed': task}
+    elif task.status == 'In Progress':
+        if lp.me.self_link != task.assignee_link:
+            print("This bug is in progress and not assigned to you.  Do you "
+                  "still want to review \nit? [yN]",
+                  end="")
+            sys.stdout.flush()
+            response = sys.stdin.readline()
+            if not response.strip().lower().startswith('y'):
+                raise KernelWorkflowError("Skipping bug %s" % bugnum)
+        return {'proposed': task}
+
+    raise KernelWorkflowError(
+              "Ignoring bug %s, not ready to promote-to-proposed"
+              % bugnum)
+
+
+def review_source_callback(lp, bugnum, tasks, full_packages, release, context):
+    # as per LP: #1290543, we need to evaluate (load) lp.me for
+    # getArchiveSubscritionURL to work
+    me = lp.load(lp.me.self_link)
+    master_source = None
+    master_version = None
+    if context['diff']:
+        master_source, master_version = get_master_kernel(lp, bugnum)
+    for source in full_packages:
+        process_source_package(
+            source, release, me, context['archive'], context['ppa'],
+            context['ubuntu'], context['startdir'], context['workdir'],
+            context['tardir'], context['esm'], context['tarcache'],
+            master_source, master_version)
+    tasks['proposed'].status = 'Fix Committed'
+    tasks['proposed'].assignee = me
+    tasks['proposed'].lp_save()
+
+
+def fetch_tarball_from_cache(directory, tardir, source, version, cwd):
+    actual_tardir = None
+    tarballs = []
+
+    glob_pattern = '%s_%s.orig.tar.*' % (source, version)
+    # first we look in the current working directory where the command was
+    # called from
+    actual_tardir = cwd
+    tarballs = glob.glob(os.path.join(cwd, glob_pattern))
+    if not tarballs:
+        actual_tardir = tardir
+        tarballs = glob.glob(os.path.join(tardir, glob_pattern))
+    if tarballs:
+        target = os.path.join(directory, os.path.basename(tarballs[0]))
+        try:
+            os.link(tarballs[0], target)
+        except FileExistsError:
+            pass
+        except:
+            # if the hard linking fails, do a copy operation
+            shutil.copy(tarballs[0], target)
+    else:
+        actual_tardir = None
+    return actual_tardir
+
+
+def save_tarball_to_cache(directory, tardir, source, version):
+    glob_pattern = '%s_%s.orig.tar.*' % (source, version)
+    to_copy = glob.glob(os.path.join(directory, glob_pattern))
+    for tarball in to_copy:
+        target = os.path.join(tardir, os.path.basename(tarball))
+        try:
+            os.link(tarball, target)
+        except FileExistsError:
+            pass
+        except:
+            # if the hard linking fails, do a copy operation
+            shutil.copy(tarball, target)
+
+
+def process_source_package(source, release, me, archive, ppa, ubuntu,
+                           start_dir, work_dir, tardir,
+                           esm=False, tar_cache=False,
+                           master_source=None, master_version=None):
+    series = ubuntu.getSeries(name_or_version=release)
+
+    ppa_src = ppa.getPublishedSources(order_by_date=True,
+                                      status='Published', exact_match=True,
+                                      distro_series=series,
+                                      source_name=source)[0]
+    ppa_ver = ppa_src.source_package_version
+    ppa_dsc = list(filter(
+                  lambda x: x.endswith('.dsc'), ppa_src.sourceFileUrls()))[0]
+    if ppa.private:
+        priv_url = me.getArchiveSubscriptionURL(archive=ppa)
+        dsc_file = os.path.basename(ppa_dsc)
+        ppa_dsc = os.path.join(priv_url, 'pool/main/l', source, dsc_file)
+
+    # since we can have one archive for more than one 'pocket', no need to do
+    # API calls more than once
+    scanned = set()
+    for pocket in archive.values():
+        if pocket.self_link in scanned:
+            continue
+        archive_uploads = series.getPackageUploads(version=ppa_ver,
+                                                   name=source,
+                                                   archive=pocket,
+                                                   exact_match=True)
+        for upload in archive_uploads:
+            if upload.status != 'Rejected':
+                print("%s_%s already copied to Ubuntu archive (%s), skipping" %
+                      (source, ppa_ver, upload.status))
+                return
+        scanned.add(pocket.self_link)
+
+    source_dsc, source_ver = get_kernel_dsc(me, archive, source, series=series)
+
+    new_fullabi = ppa_ver.split('~')[0]
+    new_majorabi = re.sub(r"\.[^.]+$", '', new_fullabi)
+    new_upstream = new_fullabi.split('-')[0]
+
+    old_fullabi = source_ver.split('~')[0]
+    old_majorabi = re.sub(r"\.[^.]+$", '', old_fullabi)
+    old_upstream = old_fullabi.split('-')[0]
+
+    real_tardir = fetch_tarball_from_cache(
+        work_dir, tardir, source, old_upstream, start_dir)
+
+    # grab the old source first
+    if esm:
+        pull_cmd = ['dget', '-u', source_dsc]
+    else:
+        # for non-ESM cases, it's just more reliable to use pull-lp-source
+        pull_cmd = ['pull-lp-source', source, source_ver]
+
+    try:
+        subprocess.check_call(pull_cmd)
+    except subprocess.CalledProcessError as e:
+        print("Failed to get archive source for %s at version %s" %
+              (source, source_ver))
+        raise e
+
+    # update contents to match what we think the new ABI should be
+    sed_cmd = ('grep -rl "{}" "{}-{}"/debian* | grep -v changelog '
+               + '| xargs -r sed -i -e"s/{}/{}/g" -e"s/{}/{}/g"').format(
+                  re.escape(old_majorabi), source, old_upstream,
+                  re.escape(old_fullabi), re.escape(new_fullabi),
+                  re.escape(old_majorabi), re.escape(new_majorabi))
+    try:
+        subprocess.check_call(sed_cmd, shell=True)
+    except subprocess.CalledProcessError as e:
+        print("Failed to postprocess archive source for %s at version %s" %
+              (source, source_ver))
+        raise e
+
+    if not real_tardir and tar_cache:
+        save_tarball_to_cache(work_dir, tardir, source, old_upstream)
+
+    # move the source dir aside so that it doesn't clobber.
+    os.rename(source + '-' + old_upstream, source + '-' + old_upstream + '.old')
+
+    real_tardir = fetch_tarball_from_cache(
+        work_dir, tardir, source, new_upstream, start_dir)
+
+    # grab the new source
+    dget_cmd = ['dget', '-u', ppa_dsc]
+    try:
+        subprocess.check_call(dget_cmd)
+    except subprocess.CalledProcessError as e:
+        print("Failed to get ppa source for %s at version %s" %
+              (source, ppa_ver))
+        raise e
+
+    if not real_tardir and tar_cache:
+        save_tarball_to_cache(work_dir, tardir, source, new_upstream)
+
+    if (master_source and master_version and
+            '-meta' not in source and '-signed' not in source):
+        # if requested, we also generate a brief diff between the new kernel
+        # and its 'master' kernel
+        generate_diff_from_master(
+            me, archive, master_source, master_version, source, new_upstream,
+            work_dir, tardir, start_dir)
+
+    # generate the diff
+    raw_diff_cmd = ('diff -uNr "{}-{}.old" "{}-{}" | filterdiff -x'
+                    + ' \'**/abi/**\' >raw_diff').format(
+                        source, old_upstream, source, new_upstream)
+    subprocess.call(raw_diff_cmd, shell=True)
+
+    # look at the diff
+    view_cmd = ('(diffstat raw_diff; cat raw_diff) | sensible-pager').format(
+                    source, old_upstream, source, new_upstream)
+    subprocess.call(view_cmd, shell=True)
+
+    print("Accept the package into -proposed? [yN] ", end="")
+    sys.stdout.flush()
+    response = sys.stdin.readline()
+    if response.strip().lower().startswith('y'):
+        copy_cmd = ['copy-proposed-kernel', release, source]
+        if esm:
+            copy_cmd.append('--esm')
+        copy_time = datetime.datetime.now(tz=pytz.utc)
+        try:
+            subprocess.check_call(copy_cmd)
+        except subprocess.CalledProcessError as e:
+            print("Failed to copy source for %s at version %s" %
+                  (source, ppa_ver))
+            raise e
+        print("Accepted")
+        # we know this isn't a kernel package containing signed bits,
+        # so don't subject ourselves to extra delays
+        if '-meta' in source or '-signed' in source:
+            return
+        print("Checking for UEFI binaries")
+        # Arbitrary 10 second delay, maybe enough to let uefi binaries hit
+        # the unapproved queue.
+        time.sleep(10)
+        # accept any related uefi binaries.  We filter as closely as possible
+        # on name without hard-coding architecture, and we also filter to
+        # only include uefi binaries that have appeared since we started the
+        # copy to avoid accepting something that might have been improperly
+        # copied into the queue by an "attacker" with upload rights.
+        uefis = []
+        for signed_type in ('uefi', 'signing'):
+            uefis.extend(series.getPackageUploads(
+                archive=archive['release'],
+                pocket='Proposed',
+                status='Unapproved',
+                custom_type=signed_type,
+                name='{}_{}_'.format(source, ppa_ver),
+                created_since_date=copy_time))
+        for uefi in uefis:
+            print("Accepting {}".format(uefi))
+            uefi.acceptFromQueue()
+
+if __name__ == '__main__':
+
+    default_release = 'cosmic'
+
+    parser = OptionParser(
+        usage="Usage: %prog [options] bug [bug ...]")
+
+    xdg_cache = os.getenv('XDG_CACHE_HOME', '~/.cache')
+    cachedir = os.path.expanduser(
+        os.path.join(xdg_cache, 'ubuntu-archive-tools/kernel-tarballs'))
+
+    parser.add_option(
+        "-l", "--launchpad", dest="launchpad_instance", default="production")
+    parser.add_option(
+        "-k", "--keep-files", dest="keep_files", action="store_true")
+    parser.add_option(
+        "-C", "--cache-tarballs", dest="caching", action="store_true")
+    parser.add_option(
+        "-t", "--tarball-directory", dest="tardir", default=cachedir)
+    parser.add_option(
+        "-e", "--esm", dest="esm", action="store_true")
+    parser.add_option(
+        "-d", "--diff-against-master", dest="diff_master",
+        action="store_true")
+
+    opts, bugs = parser.parse_args()
+
+    if len(bugs) < 1:
+        parser.error('Need to specify at least one bug number')
+
+    tardir = os.path.abspath(opts.tardir)
+
+    if opts.caching:
+        # if we enabled tarball caching, make sure the tarball directory exists
+        if not os.path.isdir(tardir):
+            try:
+                os.makedirs(tardir)
+            except:
+                parser.error(
+                    'Invalid tarball directory specified (%s)' % tardir)
+
+    launchpad = Launchpad.login_with(
+        'ubuntu-archive-tools', opts.launchpad_instance, version='devel')
+
+    ubuntu = launchpad.distributions['ubuntu']
+    # for ESM (precise) we use special PPAs for CKT testing, -proposed and
+    # release
+    archive = {}
+    if opts.esm:
+        team = 'canonical-kernel-esm'
+        archive['proposed'] = launchpad.people[team].getPPAByName(
+            distribution=ubuntu, name='proposed')
+        archive['release'] = launchpad.people['ubuntu-esm'].getPPAByName(
+            distribution=ubuntu, name='esm')
+        archive['non-esm'] = ubuntu.main_archive
+    else:
+        team = 'canonical-kernel-team'
+        archive['proposed'] = archive['release'] = ubuntu.main_archive
+    ppa = launchpad.people[team].getPPAByName(
+        distribution=ubuntu, name='ppa')
+
+    start_dir = os.getcwd()
+    context = {
+      'archive': archive, 'ppa': ppa, 'ubuntu': ubuntu,
+      'tardir': tardir, 'tarcache': opts.caching, 'startdir': start_dir,
+      'esm': opts.esm, 'diff': opts.diff_master
+      }
+    for bugnum in bugs:
+        with ExitStack() as resources:
+            cwd = mkdtemp(prefix='kernel-sru-%s-' % bugnum, dir=start_dir)
+            if not opts.keep_files:
+                resources.callback(shutil.rmtree, cwd)
+            os.chdir(cwd)
+            context['workdir'] = cwd
+            process_sru_bug(
+                launchpad, bugnum, review_task_callback,
+                review_source_callback, context)
+            os.chdir(start_dir)

@@ -1,0 +1,142 @@
+#!/usr/bin/python
+
+# Copyright (C) 2012 Canonical, Ltd.
+# Author: Brian Murray <brian@canonical.com>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+# given a release find all the packages published in proposed and
+# search each package for bug tasks about the package reported
+# since the date the package was uploaded to proposed for apport and release
+# tagged bugs that contain the version of the package from -proposed
+
+from __future__ import print_function
+
+import optparse
+
+from launchpadlib.launchpad import Launchpad
+
+try:
+    from urllib.request import urlopen
+except ImportError:
+    from urllib import urlopen
+
+
+def bugs_from_changes(change_url):
+    '''Return (bug_list, cve_list) from a .changes file URL'''
+    changelog = urlopen(change_url)
+
+    refs = []
+    bugs = set()
+
+    for l in changelog:
+        if l.startswith('Launchpad-Bugs-Fixed: '):
+            refs = l.split()[1:]
+            break
+
+    for b in refs:
+        try:
+            lpbug = lp.bugs[int(b)]
+        except KeyError:
+            continue
+        bugs.add(lpbug)
+
+    return sorted(bugs)
+
+
+if __name__ == '__main__':
+
+    APPORT_TAGS = (
+        'apport-package',
+        'apport-bug',
+        'apport-crash',
+        'apport-kerneloops',
+    )
+
+    lp = Launchpad.login_with(
+        'ubuntu-archive-tools', 'production', version='devel')
+
+    ubuntu = lp.distributions['ubuntu']
+    archive = ubuntu.getArchive(name='primary')
+
+    parser = optparse.OptionParser(usage="usage: %prog --release RELEASE")
+    parser.add_option('--release', help='', dest='release')
+
+    (opt, args) = parser.parse_args()
+
+    releases = {}
+    if not opt.release:
+        for series in ubuntu.series:
+            if not series.supported:
+                continue
+            if series.active:
+                releases[series.name] = series
+    else:
+        series = ubuntu.getSeries(name_or_version=opt.release)
+        releases[series.name] = series
+
+    for release in sorted(releases):
+        print('Release: %s' % release)
+        for spph in archive.getPublishedSources(
+                pocket='Proposed', status='Published',
+                distro_series=releases[release]):
+            package_name = spph.source_package_name
+            # for langpack updates, only keep -en as a representative
+            # cargo-culted from sru-report
+            if (package_name.startswith('language-pack-') and
+                package_name not in ('language-pack-en',
+                                     'language-pack-en-base')):
+                continue
+            date_pub = spph.date_published
+            version = spph.source_package_version
+            change_url = spph.changesFileUrl()
+
+            if not change_url:
+                print("Package %s has no changes file url")
+                continue
+
+            package = ubuntu.getSourcePackage(name=package_name)
+            tasks = []
+            # search for bugs reported by apport
+            for tag in APPORT_TAGS:
+                for task in package.searchTasks(
+                        tags=[tag, release], created_since=date_pub,
+                        tags_combinator='All'):
+                    tasks.append(task)
+            # also search for ones tagged regression-proposed
+            for task in package.searchTasks(
+                    tags=['regression-proposed', release],
+                    created_since=date_pub, tags_combinator='All'):
+                tasks.append(task)
+
+            for task in tasks:
+                if version not in task.bug.description:
+                    continue
+                sru_bugs = bugs_from_changes(change_url)
+                # check to see if any of the sru bugs are already tagged
+                # verification-failed
+                v_failed = False
+                for sru_bug in sru_bugs:
+                    if 'verification-failed' in sru_bug.tags:
+                        print('  The SRU for package %s already has a '
+                              'verification-failed bug in LP: #%s' %
+                              (package_name, sru_bug.id))
+                        v_failed = True
+                bug = task.bug
+                if not v_failed and set(APPORT_TAGS).intersection(bug.tags):
+                    print('  LP: #%s is regarding %s from -proposed' %
+                          (bug.id, package_name))
+                elif not v_failed:
+                    print('  LP: #%s is regarding %s from -proposed and '
+                          'tagged regression-proposed' %
+                          (bug.id, package_name))

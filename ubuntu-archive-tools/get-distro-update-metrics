@@ -1,0 +1,113 @@
+#! /usr/bin/python
+# Copyright 2012 Canonical Ltd.
+#
+# This script will write update metrics for a given Ubuntu release in CSV
+# format. It will output a file with updates (broken in Security vs Updates)
+# by month, as well as the number per package.
+
+from collections import defaultdict
+import csv
+import logging
+from optparse import OptionParser
+import sys
+
+from launchpadlib.launchpad import Launchpad
+
+API_NAME = 'ubuntu-update-metrics'
+
+
+def write_metrics_csv(filename, key_name, metrics):
+    """Write the metrics to a CSV file.
+
+    :param filename: The CSV filename.
+    :param key_name: The name of the metrics key.
+    :param metrics: This should be a sequence of
+        [key, {'Updates': X, 'Security': X, 'Total': X}] record.
+    """
+    logging.info('Writing metrics by %s to %s', key_name.lower(), filename)
+    writer = csv.writer(open(filename, 'wb'))
+    writer.writerow([key_name, 'Updates', 'Security', 'Total'])
+    for key, metrics in metrics:
+        writer.writerow(
+            [key, metrics['Updates'], metrics['Security'], metrics['Total']])
+
+
+def main(argv):
+    parser = OptionParser(
+        usage="%prog [options] ubuntu-release-name")
+    parser.add_option(
+        '-l', '--launchpad', default='production', dest='lp_instance',
+        help="Select the Launchpad instance to run against. Defaults to "
+        "'production'")
+    parser.add_option(
+        '-v', '--verbose', default=0, action='count', dest='verbose',
+        help="Increase verbosity of the script. -v prints info messages, "
+        "-vv will print debug messages.")
+    parser.add_option(
+        '-c', '--credentials', default=None, action='store',
+        dest='credentials',
+        help="Use the OAuth credentials in FILE instead of the desktop "
+        "one.", metavar='FILE')
+    parser.add_option(
+        '-d', '--distribution', default='ubuntu', action='store',
+        dest='distribution',
+        help="The distribution to compute metrics for. Defaults to 'ubuntu'.")
+    options, args = parser.parse_args(argv[1:])
+    if len(args) != 1:
+        parser.error('Missing archive name.')
+
+    if options.verbose >= 2:
+        log_level = logging.DEBUG
+    elif options.verbose == 1:
+        log_level = logging.INFO
+    else:
+        log_level = logging.WARNING
+    logging.basicConfig(level=log_level)
+
+    lp = Launchpad.login_with(
+        API_NAME, options.lp_instance, credentials_file=options.credentials,
+        version='devel')
+
+    try:
+        distribution = lp.distributions[options.distribution]
+    except KeyError:
+        parser.error('unknown distribution: %s' % options.distribution)
+
+    series = distribution.getSeries(name_or_version=args[0])
+    if series is None:
+        parser.error('unknown series: %s' % args[0])
+    archive = series.main_archive
+
+    updates_by_package = defaultdict(lambda: defaultdict(int))
+    updates_by_month = defaultdict(lambda: defaultdict(int))
+    for pocket in ['Updates', 'Security']:
+        logging.info(
+            'Retrieving published %s sources for %s...', pocket, args[0])
+        published_history = archive.getPublishedSources(
+            component_name='main', created_since_date=series.datereleased,
+            distro_series=series, pocket=pocket)
+        for source in published_history:
+            package_metrics = updates_by_package[source.source_package_name]
+            package_metrics[source.pocket] += 1
+            package_metrics['Total'] += 1
+
+            month = source.date_published.strftime('%Y-%m')
+            month_metrics = updates_by_month[month]
+            month_metrics[source.pocket] += 1
+            month_metrics['Total'] += 1
+
+    by_month_filename = '%s-%s-updates-by-month.csv' % (
+        options.distribution, args[0])
+    write_metrics_csv(
+        by_month_filename, 'Month', sorted(updates_by_month.items()))
+
+    by_package_filename = '%s-%s-updates-by-package.csv' % (
+        options.distribution, args[0])
+    write_metrics_csv(
+        by_package_filename, 'Package', sorted(
+            updates_by_package.items(),
+            key=lambda m: m[1]['Total'], reverse=True))
+
+
+if __name__ == '__main__':
+    main(sys.argv)

@@ -1,0 +1,234 @@
+#!/usr/bin/env python
+
+# Check for override mismatches between pockets
+# Copyright (C) 2005, 2008, 2011, 2012  Canonical Ltd.
+# Author: Colin Watson <cjwatson@ubuntu.com>
+
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+
+from __future__ import print_function
+
+import atexit
+from collections import defaultdict
+import gzip
+try:
+    from html import escape
+except ImportError:
+    from cgi import escape
+from optparse import OptionParser
+import os
+import shutil
+import sys
+import tempfile
+from textwrap import dedent
+import time
+
+import apt_pkg
+from launchpadlib.launchpad import Launchpad
+
+
+tempdir = None
+
+
+def ensure_tempdir():
+    global tempdir
+    if not tempdir:
+        tempdir = tempfile.mkdtemp(prefix='component-mismatches')
+        atexit.register(shutil.rmtree, tempdir)
+
+
+def decompress_open(tagfile):
+    ensure_tempdir()
+    decompressed = tempfile.mktemp(dir=tempdir)
+    fin = gzip.GzipFile(filename=tagfile)
+    with open(decompressed, 'wb') as fout:
+        fout.write(fin.read())
+    return open(decompressed, 'r')
+
+
+def pockets(series):
+    yield series
+    yield '%s-security' % series
+    yield '%s-proposed' % series
+    yield '%s-updates' % series
+
+
+priorities = {
+    'required': 1,
+    'important': 2,
+    'standard': 3,
+    'optional': 4,
+    'extra': 5
+}
+
+
+def priority_key(priority):
+    return priorities.get(priority, 6)
+
+
+def print_section(options, header, items):
+    print("%s:" % header)
+    print("-" * (len(header) + 1))
+    print()
+    for item in items:
+        print(item)
+    print()
+
+    if options.html_output is not None:
+        print("<h2>%s</h2>" % escape(header), file=options.html_output)
+        print("<ul>", file=options.html_output)
+        for item in items:
+            print("<li>%s</li>" % escape(item), file=options.html_output)
+        print("</ul>", file=options.html_output)
+
+
+def process(options, series, components, arches):
+    archive = os.path.expanduser('~/mirror/ubuntu/')
+
+    pkgcomp = defaultdict(lambda: defaultdict(list))
+    pkgsect = defaultdict(lambda: defaultdict(list))
+    pkgprio = defaultdict(lambda: defaultdict(list))
+    for suite in pockets(series):
+        for component in components:
+            for arch in arches:
+                try:
+                    binaries_path = "%s/dists/%s/%s/binary-%s/Packages.gz" % (
+                        archive, suite, component, arch)
+                    binaries = apt_pkg.TagFile(decompress_open(binaries_path))
+                except IOError:
+                    continue
+                suite_arch = '%s/%s' % (suite, arch)
+                for section in binaries:
+                    if 'Package' in section:
+                        pkg = section['Package']
+                        pkgcomp[pkg][component].append(suite_arch)
+                        if 'Section' in section:
+                            pkgsect[pkg][section['Section']].append(suite_arch)
+                        if 'Priority' in section:
+                            pkgprio[pkg][section['Priority']].append(
+                                suite_arch)
+
+    packages = sorted(pkgcomp)
+
+    items = []
+    for pkg in packages:
+        if len(pkgcomp[pkg]) > 1:
+            out = []
+            for component in sorted(pkgcomp[pkg]):
+                out.append("%s [%s]" %
+                           (component,
+                            ' '.join(sorted(pkgcomp[pkg][component]))))
+            items.append("%s: %s" % (pkg, ' '.join(out)))
+    print_section(
+        options, "Packages with inconsistent components between pockets",
+        items)
+
+    items = []
+    for pkg in packages:
+        if pkg in pkgsect and len(pkgsect[pkg]) > 1:
+            out = []
+            for section in sorted(pkgsect[pkg]):
+                out.append("%s [%s]" %
+                           (section,
+                            ' '.join(sorted(pkgsect[pkg][section]))))
+            items.append("%s: %s" % (pkg, ' '.join(out)))
+    print_section(
+        options, "Packages with inconsistent sections between pockets", items)
+
+    items = []
+    for pkg in packages:
+        if pkg in pkgprio and len(pkgprio[pkg]) > 1:
+            out = []
+            for priority in sorted(pkgprio[pkg], key=priority_key):
+                out.append("%s [%s]" %
+                           (priority,
+                            ' '.join(sorted(pkgprio[pkg][priority]))))
+            items.append("%s: %s" % (pkg, ' '.join(out)))
+    print_section(
+        options, "Packages with inconsistent priorities between pockets",
+        items)
+
+
+def main():
+    parser = OptionParser(
+        description='Check for override mismatches between pockets.')
+    parser.add_option(
+        "-l", "--launchpad", dest="launchpad_instance", default="production")
+    parser.add_option('-o', '--output-file', help='output to this file')
+    parser.add_option('--html-output-file', help='output HTML to this file')
+    parser.add_option('-s', '--series',
+                      help='check these series (comma-separated)')
+    options, args = parser.parse_args()
+
+    launchpad = Launchpad.login_with(
+        "pocket-mismatches", options.launchpad_instance)
+    if options.series is not None:
+        all_series = options.series.split(',')
+    else:
+        all_series = reversed([
+            series.name
+            for series in launchpad.distributions["ubuntu"].series
+            if series.status in ("Supported", "Current Stable Release")])
+    components = ["main", "restricted", "universe", "multiverse"]
+    arches = ["amd64", "arm64", "armhf", "i386", "ppc64el", "s390x"]
+
+    if options.output_file is not None:
+        sys.stdout = open('%s.new' % options.output_file, 'w')
+    if options.html_output_file is not None:
+        options.html_output = open('%s.new' % options.html_output_file, 'w')
+    else:
+        options.html_output = None
+
+    options.timestamp = time.strftime('%a %b %e %H:%M:%S %Z %Y')
+    print('Generated: %s' % options.timestamp)
+    print()
+
+    if options.html_output is not None:
+        all_series_str = escape(", ".join(all_series))
+        print(dedent("""\
+            <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN"
+             "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+            <html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
+            <head>
+              <meta http-equiv="Content-Type"
+                    content="text/html; charset=utf-8" />
+              <title>Pocket mismatches for %s</title>
+              <style type="text/css">
+                body { background: #CCCCB0; color: black; }
+              </style>
+            </head>
+            <body>
+            <h1>Pocket mismatches for %s</h1>
+            """) % (all_series_str, all_series_str),
+            file=options.html_output)
+
+    for series in all_series:
+        process(options, series, components, arches)
+
+    if options.html_output_file is not None:
+        print(
+            "<p><small>Generated: %s</small></p>" % escape(options.timestamp),
+            file=options.html_output)
+        print("</body></html>", file=options.html_output)
+        options.html_output.close()
+        os.rename(
+            '%s.new' % options.html_output_file, options.html_output_file)
+    if options.output_file is not None:
+        sys.stdout.close()
+        os.rename('%s.new' % options.output_file, options.output_file)
+
+
+if __name__ == '__main__':
+    main()

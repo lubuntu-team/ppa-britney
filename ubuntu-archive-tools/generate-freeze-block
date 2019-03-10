@@ -1,0 +1,126 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+
+# Copyright (C) 2013 Canonical Ltd.
+# Author: Iain Lane <iain.lane@canonical.com>
+
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public
+# License as published by the Free Software Foundation; either
+# version 2.1 of the License, or (at your option) any later version.
+
+# This library is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# Lesser General Public License for more details.
+
+# You should have received a copy of the GNU Lesser General Public
+# License along with this library; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301
+# USA
+
+import argparse
+import apt_pkg
+import gzip
+import io
+import json
+import logging
+import os
+import re
+import urllib.request
+import sys
+
+PARSED_SEEDS_URL = \
+    'http://qa.ubuntuwire.org/ubuntu-seeded-packages/seeded.json.gz'
+LOGGER = logging.getLogger(os.path.basename(sys.argv[0]))
+
+
+class GetPackage():
+    apt_cache_initialised = False
+
+    def __init__(self):
+        # Initialise python-apt
+        if not GetPackage.apt_cache_initialised:
+            apt_pkg.init()
+            GetPackage.apt_cache_initialised = True
+
+        self.cache = apt_pkg.Cache(None)
+        self.pkgrecords = apt_pkg.PackageRecords(self.cache)
+        self.depcache = apt_pkg.DepCache(self.cache)
+
+        # Download & parse the seeds
+        response = urllib.request.urlopen(PARSED_SEEDS_URL)
+
+        buf = io.BytesIO(response.read())
+        f = gzip.GzipFile(fileobj=buf)
+        data = f.read().decode('utf-8')
+        self.seeded_packages = json.loads(data)
+
+    def getsourcepackage(self, pkg):
+        pkg = re.sub(':.*', '', pkg)
+        try:
+            candidate = self.depcache.get_candidate_ver(self.cache[pkg])
+        except KeyError:  # no package found (arch specific?)
+            return
+        try:
+            self.pkgrecords.lookup(candidate.file_list[0])
+        except AttributeError:  # no source (pure virtual?)
+            return
+        return self.pkgrecords.source_pkg or pkg
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Generate a freeze block for'
+                                     + ' an Ubuntu milestone')
+    parser.add_argument('flavours', nargs='+',
+                        help='The participating flavours')
+    parser.add_argument('--only-unique', '-u', action='store_true',
+                        help='Block only packages unique to FLAVOURS')
+    parser.add_argument('--debug', '-d', action='store_true',
+                        help='Output some extra debugging')
+    args = parser.parse_args()
+
+    logging.basicConfig(stream=sys.stderr,
+                        level=(logging.DEBUG if args.debug
+                               else logging.WARNING))
+
+    packages = GetPackage()
+
+    output = set()
+    skip = set()
+
+    flavours = set(args.flavours)
+
+    # binary package: [ [ product, seed ] ]
+    # e.g. "gbrainy": [["edubuntu", "dvd"]]
+    for k, v in packages.seeded_packages.items():
+        source_pkg = packages.getsourcepackage(k)
+        seeding_flavours = set([x[0] for x in v if x[1] != "supported"])
+
+        # If you don't get to freeze others' packages
+        if args.only_unique:
+            not_releasing_seeding_flavours = seeding_flavours - flavours
+        else:
+            not_releasing_seeding_flavours = None
+
+        if not_releasing_seeding_flavours:
+            LOGGER.debug(("Skipping %s (%s binary package) because it's"
+                         + " seeded on %s") % (source_pkg, k, v))
+            output.discard(source_pkg)
+            skip.add(source_pkg)
+            continue
+
+        if source_pkg and source_pkg in skip:
+            continue
+
+        if seeding_flavours.intersection(flavours) and source_pkg:
+            LOGGER.debug("Adding %s (%s binary package) due to %s"
+                         % (source_pkg, k, v))
+            output.add(source_pkg)
+            skip.add(source_pkg)
+
+    print ("block", " ".join(sorted(output)))
+
+
+if __name__ == "__main__":
+    main()

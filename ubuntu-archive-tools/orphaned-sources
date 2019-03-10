@@ -1,0 +1,107 @@
+#! /usr/bin/python
+
+from __future__ import print_function
+
+import atexit
+from contextlib import closing
+import gzip
+from optparse import OptionParser
+import shutil
+import sys
+import tempfile
+try:
+    from urllib.request import urlretrieve
+except ImportError:
+    from urllib import urlretrieve
+
+import apt_pkg
+from launchpadlib.launchpad import Launchpad
+
+import lputils
+
+
+tempdir = None
+
+
+def ensure_tempdir():
+    global tempdir
+    if not tempdir:
+        tempdir = tempfile.mkdtemp(prefix="orphaned-sources")
+        atexit.register(shutil.rmtree, tempdir)
+
+
+def decompress_open(tagfile):
+    if tagfile.startswith("http:") or tagfile.startswith("ftp:"):
+        url = tagfile
+        tagfile = urlretrieve(url)[0]
+
+    if tagfile.endswith(".gz"):
+        ensure_tempdir()
+        decompressed = tempfile.mktemp(dir=tempdir)
+        with closing(gzip.GzipFile(tagfile)) as fin:
+            with open(decompressed, "wb") as fout:
+                fout.write(fin.read())
+        return open(decompressed, "r")
+    else:
+        return open(tagfile, "r")
+
+
+def archive_base(archtag):
+    if archtag in ("amd64", "i386", "src"):
+        return "http://archive.ubuntu.com/ubuntu"
+    else:
+        return "http://ports.ubuntu.com/ubuntu-ports"
+
+
+def source_names(options):
+    sources = set()
+    for component in "main", "restricted", "universe", "multiverse":
+        url = "%s/dists/%s/%s/source/Sources.gz" % (
+            archive_base("src"), options.suite, component)
+        print("Reading %s ..." % url, file=sys.stderr)
+        for section in apt_pkg.TagFile(decompress_open(url)):
+            sources.add(section["Package"])
+    return sources
+
+
+def referenced_sources(options):
+    sources = set()
+    for component in "main", "restricted", "universe", "multiverse":
+        for arch in options.architectures:
+            archtag = arch.architecture_tag
+            for suffix in "", "/debian-installer":
+                url = "%s/dists/%s/%s%s/binary-%s/Packages.gz" % (
+                    archive_base(archtag), options.suite, component, suffix,
+                    archtag)
+                print("Reading %s ..." % url, file=sys.stderr)
+                for section in apt_pkg.TagFile(decompress_open(url)):
+                    if "Source" in section:
+                        sources.add(section["Source"].split(" ", 1)[0])
+                    else:
+                        sources.add(section["Package"])
+    return sources
+
+
+def main():
+    parser = OptionParser(
+        description="Check for sources without any remaining binaries.")
+    parser.add_option(
+        "-l", "--launchpad", dest="launchpad_instance", default="production")
+    parser.add_option("-s", "--suite", help="check this suite")
+    options, _ = parser.parse_args()
+
+    options.distribution = "ubuntu"
+    options.launchpad = Launchpad.login_anonymously(
+        "orphaned-sources", options.launchpad_instance)
+    lputils.setup_location(options)
+
+    if options.pocket != "Release":
+        parser.error("cannot run on non-release pocket")
+
+    orphaned_sources = source_names(options) - referenced_sources(options)
+    for source in sorted(orphaned_sources):
+        print(source)
+
+
+if __name__ == '__main__':
+    main()
