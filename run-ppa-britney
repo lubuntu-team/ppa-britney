@@ -9,7 +9,7 @@ for RELEASE in $RELEASES; do
     fi
 
     # This is the main script, fetching the archives and running Britney
-    ./fetch-indexes;
+    ./fetch-indexes $RELEASE;
 
     # Britney outputs the candidates for testing migration, read the additions
     egrep -v '^(#|-)' britney_output/*/HeidiOutputDelta > candidates || echo "No candidates found.";
