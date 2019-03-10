@@ -10,7 +10,7 @@ NONINST_STATUS      = britney_output/$BRITNEY_TIMESTAMP/non-installable-status
 EXCUSES_OUTPUT      = britney_output/$BRITNEY_TIMESTAMP/excuses.html
 EXCUSES_YAML_OUTPUT = britney_output/$BRITNEY_TIMESTAMP/excuses.yaml
 UPGRADE_OUTPUT      = britney_output/$BRITNEY_TIMESTAMP/output.txt
-HEIDI_OUTPUT        =
+HEIDI_OUTPUT        = britney_output/$BRITNEY_TIMESTAMP/HeidiOutput
 
 # Appease piuparts
 STATE_DIR         = /tmp/piuparts-is-not-used
