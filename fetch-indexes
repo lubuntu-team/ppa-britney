@@ -25,7 +25,7 @@
 
 set -u
 
-RELEASE=$1
+export RELEASE=$1
 
 # Download files in parallel in background, only if there is an update
 refresh() {
