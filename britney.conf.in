@@ -13,7 +13,7 @@ UPGRADE_OUTPUT      = britney_output/$BRITNEY_TIMESTAMP/output.txt
 HEIDI_OUTPUT        = britney_output/$BRITNEY_TIMESTAMP/HeidiOutput
 
 # Appease piuparts
-STATE_DIR         = /tmp/piuparts-is-not-used
+STATE_DIR         = piuparts-is-not-used
 
 # List of release architectures
 ARCHITECTURES     = $ARCHES $PORTS_ARCHES
