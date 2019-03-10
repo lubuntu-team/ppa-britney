@@ -6,10 +6,10 @@ UNSTABLE          = britney_data/$SOURCE_PPA-$RELEASE
 PARTIAL_UNSTABLE  = yes
 
 # Output
-NONINST_STATUS      = britney_output/$BRITNEY_TIMESTAMP/$SOURCE_PPA-$RELEASE-non-installable-status
-EXCUSES_OUTPUT      = britney_output/$BRITNEY_TIMESTAMP/$SOURCE_PPA-$RELEASE-excuses.html
-EXCUSES_YAML_OUTPUT = britney_output/$BRITNEY_TIMESTAMP/$SOURCE_PPA-$RELEASE-excuses.yaml
-UPGRADE_OUTPUT      =
+NONINST_STATUS      = britney_output/$BRITNEY_TIMESTAMP/non-installable-status
+EXCUSES_OUTPUT      = britney_output/$BRITNEY_TIMESTAMP/excuses.html
+EXCUSES_YAML_OUTPUT = britney_output/$BRITNEY_TIMESTAMP/excuses.yaml
+UPGRADE_OUTPUT      = britney_output/$BRITNEY_TIMESTAMP/output.txt
 HEIDI_OUTPUT        =
 
 # Appease piuparts
