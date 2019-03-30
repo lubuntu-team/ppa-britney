@@ -17,15 +17,18 @@ for RELEASE in $RELEASES; do
     egrep -v '^#' britney_output/$BRITNEY_TIMESTAMP/HeidiOutputDelta > candidates || echo "No candidates found.";
 
     while read -r -a package; do
-        if [ $ARCHIVE_TYPE = "ppa" ]; then
-            COPY="./ubuntu-archive-tools/copy-package"
-            REMOVE="./ubuntu-archive-tools/remove-package"
-            if echo ${package[0]} | egrep -q "^-"; then
-                $COPY -y -b -s $RELEASE --from "ppa:$LP_TEAM/ubuntu/$DEST_PPA" --to "ppa:$LP_TEAM/ubuntu/$SOURCE_PPA" --version "${package[1]}" "`echo ${package[0]} | sed 's/-//'`";
-                $REMOVE -y -s $RELEASE --archive "ppa:$LP_TEAM/ubuntu/$DEST_PPA" --version "${package[1]}" --removal-comment="demoted to proposed" "`echo ${package[0]} | sed 's/-//'`";
-            else
-                $COPY -y -b -s $RELEASE --from "ppa:$LP_TEAM/ubuntu/$SOURCE_PPA" --to "ppa:$LP_TEAM/ubuntu/$DEST_PPA" --version "${package[1]}" "${package[0]}";
-                $REMOVE -y -s $RELEASE --archive "ppa:$LP_TEAM/ubuntu/$SOURCE_PPA" --version "${package[1]}" --removal-comment="moved to release" "${package[0]}";
+        # This only acts on sources; binaries require manual cleanup
+        if [ ${#package[@]} = 2 ];
+            if [ $ARCHIVE_TYPE = "ppa" ]; then
+                COPY="./ubuntu-archive-tools/copy-package"
+                REMOVE="./ubuntu-archive-tools/remove-package"
+                if echo ${package[0]} | egrep -q "^-"; then
+                    $COPY -y -b -s $RELEASE --from "ppa:$LP_TEAM/ubuntu/$DEST_PPA" --to "ppa:$LP_TEAM/ubuntu/$SOURCE_PPA" --version "${package[1]}" "`echo ${package[0]} | sed 's/-//'`";
+                    $REMOVE -y -s $RELEASE --archive "ppa:$LP_TEAM/ubuntu/$DEST_PPA" --version "${package[1]}" --removal-comment="demoted to proposed" "`echo ${package[0]} | sed 's/-//'`";
+                else
+                    $COPY -y -b -s $RELEASE --from "ppa:$LP_TEAM/ubuntu/$SOURCE_PPA" --to "ppa:$LP_TEAM/ubuntu/$DEST_PPA" --version "${package[1]}" "${package[0]}";
+                    $REMOVE -y -s $RELEASE --archive "ppa:$LP_TEAM/ubuntu/$SOURCE_PPA" --version "${package[1]}" --removal-comment="moved to release" "${package[0]}";
+                fi
             fi
         fi
     done < candidates;
