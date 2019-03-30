@@ -18,7 +18,7 @@ for RELEASE in $RELEASES; do
 
     while read -r -a package; do
         # This only acts on sources; binaries require manual cleanup
-        if [ ${#package[@]} = 2 ];
+        if [ ${#package[@]} = 2 ]; then
             if [ $ARCHIVE_TYPE = "ppa" ]; then
                 COPY="./ubuntu-archive-tools/copy-package"
                 REMOVE="./ubuntu-archive-tools/remove-package"
