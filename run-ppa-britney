@@ -17,8 +17,8 @@ for RELEASE in $RELEASES; do
     while read -r -a package; do
         # This can eventually be extendable to different archive types
         if [ $ARCHIVE_TYPE = "ppa" ]; then
-            ./ubuntu-archive-tools/copy-package -y -b -s $RELEASE --from "ppa:lubuntu-ci/ubuntu/unstable-ci-proposed" --to "ppa:lubuntu-ci/ubuntu/unstable-ci" --version "${package[1]}" "${package[0]}";
-            ./ubuntu-archive-tools/remove-package -y -s $RELEASE --archive "ppa:lubuntu-ci/ubuntu/unstable-ci-proposed" --version "${package[1]}" --removal-comment="moved to release" "${package[0]}";
+            ./ubuntu-archive-tools/copy-package -y -b -s $RELEASE --from "ppa:$LP_TEAM/ubuntu/$SOURCE_PPA" --to "ppa:$LP_TEAM/ubuntu/$DEST_PPA" --version "${package[1]}" "${package[0]}";
+            ./ubuntu-archive-tools/remove-package -y -s $RELEASE --archive "ppa:$LP_TEAM/ubuntu/$SOURCE_PPA" --version "${package[1]}" --removal-comment="moved to release" "${package[0]}";
         fi
     done < candidates;
     rm -rf britney_output/;
