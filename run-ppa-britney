@@ -11,14 +11,22 @@ for RELEASE in $RELEASES; do
     # This is the main script, fetching the archives and running Britney
     ./fetch-indexes $RELEASE;
 
-    # Britney outputs the candidates for testing migration, read the additions
-    egrep -v '^(#|-)' britney_output/$BRITNEY_TIMESTAMP/HeidiOutputDelta > candidates || echo "No candidates found.";
+    # Britney outputs the candidates for testing migration, read the delta
+    # Removals from the release pocket start with "-" while additions have no
+    # prefix; this has to be accounted for in the archive commands seen below
+    egrep -v '^#' britney_output/$BRITNEY_TIMESTAMP/HeidiOutputDelta > candidates || echo "No candidates found.";
 
     while read -r -a package; do
-        # This can eventually be extendable to different archive types
         if [ $ARCHIVE_TYPE = "ppa" ]; then
-            ./ubuntu-archive-tools/copy-package -y -b -s $RELEASE --from "ppa:$LP_TEAM/ubuntu/$SOURCE_PPA" --to "ppa:$LP_TEAM/ubuntu/$DEST_PPA" --version "${package[1]}" "${package[0]}";
-            ./ubuntu-archive-tools/remove-package -y -s $RELEASE --archive "ppa:$LP_TEAM/ubuntu/$SOURCE_PPA" --version "${package[1]}" --removal-comment="moved to release" "${package[0]}";
+            COPY="./ubuntu-archive-tools/copy-package"
+            REMOVE="./ubuntu-archive-tools/remove-package"
+            if echo ${package[0]} | egrep -q "^-"; then
+                $COPY -y -b -s $RELEASE --from "ppa:$LP_TEAM/ubuntu/$DEST_PPA" --to "ppa:$LP_TEAM/ubuntu/$SOURCE_PPA" --version "${package[1]}" "${package[0]}";
+                $REMOVE -y -s $RELEASE --archive "ppa:$LP_TEAM/ubuntu/$DEST_PPA" --version "${package[1]}" --removal-comment="demoted to proposed" "${package[0]}";
+            else
+                $COPY -y -b -s $RELEASE --from "ppa:$LP_TEAM/ubuntu/$SOURCE_PPA" --to "ppa:$LP_TEAM/ubuntu/$DEST_PPA" --version "${package[1]}" "${package[0]}";
+                $REMOVE -y -s $RELEASE --archive "ppa:$LP_TEAM/ubuntu/$SOURCE_PPA" --version "${package[1]}" --removal-comment="moved to release" "${package[0]}";
+            fi
         fi
     done < candidates;
     rm -rf britney_output/;
