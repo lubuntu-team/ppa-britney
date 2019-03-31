@@ -1,7 +1,10 @@
 #!/bin/bash
 
 for RELEASE in $RELEASES; do
+    export BRITNEY_TIMESTAMP=$(date +"%Y-%m-%d_%H:%M:%S")
+
     echo "Release: $RELEASE";
+    echo "Timestamp: $BRITNEY_TIMESTAMP"
 
     if [ $ARCHIVE_TYPE = "ppa" ]; then
         export SOURCE_PPA_URL="http://ppa.launchpad.net/$LP_TEAM/$SOURCE_PPA/ubuntu/dists/$RELEASE/main";
@@ -32,5 +35,4 @@ for RELEASE in $RELEASES; do
             fi
         fi
     done < candidates;
-    rm -rf britney_output/;
 done
