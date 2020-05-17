@@ -1,4 +1,4 @@
-#! /usr/bin/python
+#! /usr/bin/python3
 
 # Copyright (C) 2012 Canonical Ltd.
 # Author: Colin Watson <cjwatson@ubuntu.com>
@@ -80,12 +80,12 @@ def queue_items(options, args):
     if not args:
         args = ['']
 
-    items = collections.OrderedDict()
+    items = []
     for arg in args:
         arg = arg.strip()
         if arg.isdigit():
             item = queue_item(options, arg)
-            if item in items:
+            if item.self_link in {item.self_link for item in items}:
                 continue
             if item.status != options.queue:
                 raise ValueError(
@@ -103,7 +103,7 @@ def queue_items(options, args):
                                  item_suite, options.distribution.name,
                                  options.suite))
             if queue_item_allowed(options, item):
-                items[item] = 1
+                items.append(item)
         else:
             kwargs = {}
             if "/" in arg:
@@ -116,7 +116,7 @@ def queue_items(options, args):
                 **kwargs)
             for item in new_items:
                 if queue_item_allowed(options, item):
-                    items[item] = 1
+                    items.append(item)
 
     return items
 

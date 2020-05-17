@@ -1,4 +1,4 @@
-#! /usr/bin/python
+#! /usr/bin/python3
 
 # Copyright (C) 2009, 2010, 2011, 2012 Canonical Ltd.
 # Authors:
@@ -32,15 +32,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
-try:
-    from urllib.parse import unquote, urlsplit
-    from urllib.request import urlopen, urlretrieve
-except ImportError:
-    from urllib import unquote, urlretrieve
-    from urllib2 import urlopen
-    from urlparse import urlsplit
 
 from launchpadlib.launchpad import Launchpad
+from six.moves.urllib.parse import unquote, urlsplit
+from six.moves.urllib.request import urlopen, urlretrieve
 from ubuntutools.question import YesNoQuestion
 
 import lputils
@@ -81,7 +76,7 @@ def find_matching_uploads(options, explicit_suite):
                 continue
             changes_file = urlopen(upload.changes_file_url)
             try:
-                changes = changes_file.read()
+                changes = changes_file.read().decode("UTF-8", errors="replace")
             finally:
                 changes_file.close()
             if (" unstable; urgency=" not in changes and

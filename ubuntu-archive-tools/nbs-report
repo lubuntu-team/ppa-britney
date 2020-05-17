@@ -1,7 +1,8 @@
-#!/usr/bin/python
+#!/usr/bin/python2.7
 
 # Copyright (C) 2011, 2012  Canonical Ltd.
 # Author: Martin Pitt <martin.pitt@ubuntu.com>
+# Author: Brian Murray <brian@ubuntu.com>
 
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -28,6 +29,10 @@ import sys
 import time
 
 from charts import make_chart, make_chart_header
+from utils import read_tag_file
+
+default_base = '/home/ubuntu-archive/mirror/ubuntu'
+rdeps_with_alternates = []
 
 
 def parse_checkrdepends_file(path, pkgmap):
@@ -48,24 +53,70 @@ def parse_checkrdepends_file(path, pkgmap):
             pkgmap.setdefault(rdep, (cur_component, []))[1].append(cur_arch)
 
 
-def _pkg_removable(pkg, nbs, checked_v):
-    '''Recursively check if pakcage is removable.
+def _pkg_removable(options, pkg, nbs, checked_v):
+    '''Recursively check if package is removable.
 
     checked_v is the working set of already checked vertices, to avoid infinite
     loops.
     '''
     checked_v.add(pkg)
+    packages = {}
     for rdep in nbs.get(pkg, []):
         if rdep in checked_v:
             continue
-        #checked_v.add(rdep)
-        if not rdep in nbs:
+        global rdeps_with_alternates
+        # utilize a copy of the arches as nbs will be modified
+        arches = list(nbs[pkg][rdep][1])
+        for arch in arches:
+            alternate_available = False
+            if arch == 'build':
+                ptype = 'source'
+                file = 'Sources'
+            else:
+                ptype = 'binary-%s' % arch
+                file = 'Packages'
+            key = '%s/dists/%s/%s/%s/%s.gz' % \
+                  (options.archive_base, options.suite, nbs[pkg][rdep][0],
+                   ptype, file)
+            if key not in packages:
+                packages[key] = read_tag_file(key, rdep)
+            stanzas = packages[key]
+            for stanza in stanzas:
+                if 'binary' in ptype:
+                    fields = ('Pre-Depends', 'Depends', 'Recommends')
+                else:
+                    fields = ('Build-Depends', 'Build-Depends-Indep')
+                for field in fields:
+                    if field not in stanza:
+                        continue
+                    if '|' not in stanza[field]:
+                        continue
+                    for or_dep in stanza[field].split(','):
+                        if '|' not in or_dep:
+                            continue
+                        alternatives = [dep.strip()
+                                        for dep in or_dep.split('|')]
+                        if pkg not in alternatives:
+                            continue
+                        for dep in alternatives:
+                            if dep == pkg:
+                                continue
+                            if dep not in nbs:
+                                alternate_available = True
+                                break
+            if alternate_available:
+                nbs[pkg][rdep][1].remove(arch)
+
+        if len(nbs[pkg][rdep][1]) == 0:
+            rdeps_with_alternates.append(rdep)
+
+        if rdep not in nbs and rdep not in rdeps_with_alternates:
             try:
                 checked_v.remove(rdep)
             except KeyError:
                 pass
             return False
-        if not _pkg_removable(rdep, nbs, checked_v):
+        if not _pkg_removable(options, rdep, nbs, checked_v):
             try:
                 checked_v.remove(rdep)
             except KeyError:
@@ -74,7 +125,7 @@ def _pkg_removable(pkg, nbs, checked_v):
     return True
 
 
-def get_removables(nbs):
+def get_removables(options, nbs):
     '''Get set of removable packages.
 
     This includes packages with no rdepends and disconnected subgraphs, i. e.
@@ -86,10 +137,9 @@ def get_removables(nbs):
         if p in removable:
             continue
         checked_v = set()
-        if _pkg_removable(p, nbs, checked_v):
-            # we can add the entire cluster here, not just p; avoids
-            # re-checking the other vertices in that cluster
-            removable.update(checked_v)
+        if _pkg_removable(options, p, nbs, checked_v):
+            # we only add packages which are nbs to removable
+            removable.update([p for p in checked_v if p in nbs])
 
     return removable
 
@@ -97,6 +147,7 @@ def get_removables(nbs):
 def html_report(options, nbs, removables):
     '''Generate HTML report from NBS map.'''
 
+    global rdeps_with_alternates
     print('''\
 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN"
  "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
@@ -148,9 +199,11 @@ def html_report(options, nbs, removables):
             cls = 'removable'
         else:
             cls = 'normal'
-        print('<tr><th colspan="4"><span class="%s">%s</span></td></tr>' %
+        print('<tr><th colspan="4"><span class="%s">%s</span></th></tr>\n' %
               (cls, pkg), end="")
         for rdep in sorted(nbsmap):
+            if rdep in rdeps_with_alternates:
+                continue
             (component, arches) = nbsmap[rdep]
 
             if component in ('main', 'restricted'):
@@ -208,8 +261,12 @@ def main():
     parser = OptionParser(
         usage="%prog <checkrdepends output directory>",
         description="Generate an HTML report of current NBS binary packages.")
+    parser.add_option('-B', '--archive-base', dest='archive_base',
+                      help=('archive base directory (default: %s)' %
+                            default_base),
+                      default=default_base)
     parser.add_option('-d', '--distribution', default='ubuntu')
-    parser.add_option('-s', '--suite', default='disco')
+    parser.add_option('-s', '--suite', default='groovy')
     parser.add_option(
         '--csv-file', help='record CSV time series data in this file')
     options, args = parser.parse_args()
@@ -246,7 +303,7 @@ def main():
     #                    rd.replace('-', '').replace('.', '')), file=dot)
     #    print('}', file=dot)
 
-    removables = get_removables(nbs)
+    removables = get_removables(options, nbs)
 
     html_report(options, nbs, removables)
 

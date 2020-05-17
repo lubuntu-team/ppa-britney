@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 # Sync a suite with a Seed list.
 # Copyright (C) 2004, 2005, 2009, 2010, 2011, 2012  Canonical Ltd.
@@ -22,8 +22,6 @@
 #       listed for promotion at once
 #       i.e. to allow 'change-override -S' usage
 
-from __future__ import print_function
-
 __metaclass__ = type
 
 import atexit
@@ -36,6 +34,7 @@ try:
 except ImportError:
     from cgi import escape
 import json
+from operator import attrgetter
 from optparse import OptionParser
 import os
 import shutil
@@ -43,10 +42,7 @@ import sys
 import tempfile
 from textwrap import dedent
 import time
-try:
-    from urllib.parse import quote_plus
-except ImportError:
-    from urllib import quote_plus
+from urllib.parse import quote_plus
 
 import apt_pkg
 from launchpadlib.launchpad import Launchpad
@@ -128,7 +124,7 @@ def read_current_source(options):
                             archive_source[pkg] = (
                                 version, component.split("/")[0])
 
-    for pkg, (version, component) in archive_source.items():
+    for pkg, (version, component) in list(archive_source.items()):
         if component in options.components:
             current_source[pkg] = (version, component)
 
@@ -140,9 +136,7 @@ def read_current_binary(options):
         components_with_di.append('%s/debian-installer' % component)
     for suite in options.suites:
         for component in components_with_di:
-            for arch in [
-                    "i386", "amd64", "armhf", "arm64", "ppc64el",
-                    "s390x"]:
+            for arch in options.architectures:
                 binaries_path = "%s/dists/%s/%s/binary-%s/Packages.gz" % (
                     options.archive_dir, suite, component, arch)
                 for section in apt_pkg.TagFile(decompress_open(binaries_path)):
@@ -161,7 +155,7 @@ def read_current_binary(options):
                                     archive_binary[pkg][0], version) < 0:
                                 archive_binary[pkg] = (version, component, src)
 
-    for pkg, (version, component, src) in archive_binary.items():
+    for pkg, (version, component, src) in list(archive_binary.items()):
         if component in options.components:
             current_binary[pkg] = (version, component, src)
 
@@ -183,8 +177,7 @@ def read_germinate(options):
         # ideally supported+build-depends too, but Launchpad's
         # cron.germinate doesn't save this
 
-        for arch in ["i386", "amd64", "armhf", "arm64", "ppc64el",
-                     "s390x"]:
+        for arch in options.architectures:
             for seed in seeds:
                 filename = "%s/%s_%s_%s_%s" % (
                     options.germinate_path, seed, flavour, options.suite, arch)
@@ -264,13 +257,13 @@ def find_signer(options, source):
         exact_match=True)
     if not publications:
         return('no publications found', '')
-    sorted_pubs = sorted([(ps.date_published, ps)
-                          for ps in publications
-                          if ps.date_published is not None], reverse=True)
+    sorted_pubs = sorted(
+        [ps for ps in publications if ps.date_published is not None],
+        key=attrgetter('date_published'), reverse=True)
     for pub in sorted_pubs:
-        if pub[1].package_signer:
-            signer = pub[1].package_signer.name
-            web_link = pub[1].package_signer.web_link
+        if pub.package_signer:
+            signer = pub.package_signer.name
+            web_link = pub.package_signer.web_link
             return(signer, web_link)
         else:
             signer = ''
@@ -343,8 +336,8 @@ def do_dot(why, fd, mir_bugs, suite):
 
     fd.write(
         'digraph "component-mismatches: movements to main/restricted" {\n')
-    for s, binwhy in why.iteritems():
-        for binary, why in binwhy.iteritems():
+    for s, binwhy in why.items():
+        for binary, why in binwhy.items():
             # ignore binaries from this source, and "rescued"
             if why in binwhy or why.startswith('Rescued'):
                 continue
@@ -472,7 +465,7 @@ def get_teams(options, source):
 
     if os.path.exists(options.package_team_mapping):
         with open(options.package_team_mapping) as ptm_file:
-            for team, packages in json.load(ptm_file).items():
+            for team, packages in list(json.load(ptm_file).items()):
                 if team == "unsubscribed":
                     continue
                 for package in packages:
@@ -575,7 +568,7 @@ def do_output(options,
     package_team_mapping = defaultdict(set)
     if os.path.exists(options.package_team_mapping):
         with open(options.package_team_mapping) as ptm_file:
-            for team, packages in json.load(ptm_file).items():
+            for team, packages in (json.load(ptm_file).items()):
                 if team == "unsubscribed":
                     continue
                 for package in packages:
@@ -741,7 +734,7 @@ def do_output(options,
             }
         results["source demotions"] += len(output)
 
-    for title, output_spec in all_output.items():
+    for title, output_spec in list(all_output.items()):
         source_and_binary = output_spec.get("source_and_binary", False)
         binary_only = output_spec.get("binary_only", False)
         print_section_text(
@@ -882,12 +875,20 @@ def main():
     else:
         options.suites = [options.suite]
 
+    options.series = options.distro.getSeries(name_or_version=options.suites[0])
+    options.architectures = [a.architecture_tag for a in options.series.architectures]
+
     if options.output_file is not None:
         sys.stdout = open('%s.new' % options.output_file, 'w')
     if options.html_output_file is not None:
         options.html_output = open('%s.new' % options.html_output_file, 'w')
     else:
         options.html_output = None
+
+    # Force encoding to UTF-8 even in non-UTF-8 locales.
+    import io
+    sys.stdout = io.TextIOWrapper(
+        sys.stdout.detach(), encoding="UTF-8", line_buffering=True)
 
     options.time = time.time()
     options.timestamp = time.strftime(

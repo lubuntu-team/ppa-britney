@@ -77,7 +77,11 @@ class QATrackerRPCObject():
                 except ValueError:
                     setattr(self, key, None)
             else:
-                setattr(self, key, str(rpc_dict[key]))
+                import sys
+                if sys.version_info > (3,):
+                    setattr(self, key, str(rpc_dict[key]))
+                else:
+                    setattr(self, key, unicode(rpc_dict[key]))
 
         self.tracker = tracker
 

@@ -46,20 +46,18 @@ def release_task_callback(lp, bugnum, task, context):
                       % bugnum)
             return {}
         return {'proposed': task}
-    if subtask == 'promote-to-updates':
-        if task.status != 'Confirmed':
-            raise KernelWorkflowError(
-                      "Ignoring bug %s, not ready to promote-to-updates"
-                      % bugnum)
-            return {}
+    if subtask == 'promote-to-updates' and task.status in ('Confirmed', 'Fix Released'):
         return {'updates': task}
-    if (subtask == 'promote-to-security' and task.status == 'Confirmed'):
+    if subtask == 'promote-to-security' and task.status == 'Confirmed':
         return {'security': task}
     return {}
 
 
 def release_source_callback(lp, bugnum, tasks, full_packages, release, context):
-    if not 'proposed' in tasks or not 'updates' in tasks:
+    if 'proposed' not in tasks or 'updates' not in tasks:
+        raise KernelWorkflowError()
+    if (tasks['updates'].status == 'Fix Released' and
+            'security' not in tasks):
         raise KernelWorkflowError()
     cmd = ['sru-release', '--no-bugs', release]
     cmd.extend(full_packages)
@@ -71,10 +69,11 @@ def release_source_callback(lp, bugnum, tasks, full_packages, release, context):
         print("Failed to run sru-release for %s" % bugnum)
         raise
 
-    tasks['updates'].status = 'Fix Committed'
-    tasks['updates'].assignee = lp.me
-    tasks['updates'].lp_save()
-    if 'security' in tasks:
+    if 'updates' in tasks and tasks['updates'].status != 'Fix Released':
+        tasks['updates'].status = 'Fix Committed'
+        tasks['updates'].assignee = lp.me
+        tasks['updates'].lp_save()
+    if 'security' in tasks and tasks['security'].status != 'Fix Released':
         tasks['security'].status = 'Fix Committed'
         tasks['security'].assignee = lp.me
         tasks['security'].lp_save()

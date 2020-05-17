@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python2.7
 
 # Copyright (C) 2013 Canonical Ltd.
 # Author: Brian Murray <brian.murray@canonical.com>
@@ -261,6 +261,8 @@ def create_email_notifications(releases, spph_buckets):
             signer_name = signer.name
             # use the changes file as a backup method for determining email addresses
             changes_file_url = spph.changesFileUrl()
+            changer_name = ''
+            changer_email = ''
             try:
                 changes_file = urlopen(changes_file_url)
                 for line in changes_file.readlines():

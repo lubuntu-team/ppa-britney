@@ -99,8 +99,12 @@ def parse_removals_file(options, removals_file):
         # Removed the following packages from unstable:
         elif state == "removed from":
             # complete processing of the date from the preceding line
-            removal["date"] = time.mktime(time.strptime(
-                date, "%a, %d %b %Y %H:%M:%S %z"))
+            try:
+                removal["date"] = time.mktime(time.strptime(
+                    date, "%a, %d %b %Y %H:%M:%S %z"))
+            except ValueError:
+                removal["date"] = time.mktime(time.strptime(
+                    date, "%a  %d %b %H:%M:%S %Z %Y"))
             removal["ftpmaster"] = ftpmaster.replace("] [ftpmaster: ", "")
 
             prefix = "Removed the following packages from "
@@ -173,7 +177,7 @@ def show_reverse_depends(options, package):
     series_name = options.series.name
     commands = (
         ["reverse-depends", "-r", series_name, "src:%s" % package],
-        ["reverse-depends", "-r", series_name, "-b", "src:%s" % package],
+        ["reverse-depends", "-r", series_name, "-a", "source", "src:%s" % package],
     )
     for command in commands:
         subp = subprocess.Popen(command, stdout=subprocess.PIPE)

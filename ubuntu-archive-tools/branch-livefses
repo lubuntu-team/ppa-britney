@@ -1,4 +1,4 @@
-#! /usr/bin/python
+#! /usr/bin/python3
 
 # Copyright (C) 2012  Canonical Ltd.
 # Author: Colin Watson <cjwatson@ubuntu.com>
@@ -19,67 +19,74 @@
 
 from __future__ import print_function
 
-from optparse import OptionParser
+import argparse
 
 from launchpadlib.launchpad import Launchpad
+import lazr.restfulclient.errors
 
 
-def branch_livefses(options, owner):
-    for livefs in list(options.launchpad.livefses):
+def branch_livefses(args, owner):
+    for livefs in list(args.launchpad.livefses):
         if (livefs.owner == owner and
-                livefs.distro_series == options.source_series):
+                livefs.distro_series == args.source_series):
             print("Branching %s for %s ..." % (
-                livefs.web_link, options.dest_series.name))
-            new_livefs = options.launchpad.livefses.new(
-                owner=owner, distro_series=options.dest_series,
-                name=livefs.name, metadata=livefs.metadata)
+                livefs.web_link, args.dest_series.name))
+            try:
+                new_livefs = args.launchpad.livefses.getByName(
+                    owner=owner, distro_series=args.dest_series,
+                    name=livefs.name)
+            except lazr.restfulclient.errors.NotFound:
+                new_livefs = args.launchpad.livefses.new(
+                    owner=owner, distro_series=args.dest_series,
+                    name=livefs.name, metadata=livefs.metadata)
             new_livefs.require_virtualized = livefs.require_virtualized
             new_livefs.relative_build_score = livefs.relative_build_score
-            new_livefs.lp_save()
+            try:
+                new_livefs.lp_save()
+            except lazr.restfulclient.errors.Unauthorized:
+                print("Could not devirt ppa, ask Launchpad team for support.")
+                pass
             print("  %s" % new_livefs.web_link)
 
 
 def main():
-    parser = OptionParser(usage="usage: %prog [options] OWNER")
-    parser.add_option(
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
         "-l", "--launchpad", dest="launchpad_instance", default="production")
-    parser.add_option(
+    parser.add_argument(
         "-d", "--distribution", default="ubuntu", metavar="DISTRIBUTION",
         help="branch live filesystems for DISTRIBUTION")
-    parser.add_option(
+    parser.add_argument(
         "--source-series",
         help="source series (default: current stable release)")
-    parser.add_option(
+    parser.add_argument(
         "--dest-series",
         help="destination series (default: series in pre-release freeze)")
-    options, args = parser.parse_args()
-    if not args:
-        parser.error(
-            "You must specify an owner whose live filesystems you want to "
-            "copy.")
+    parser.add_argument("owner", help="owner of live filesystems to copy")
+    args = parser.parse_args()
 
-    options.launchpad = Launchpad.login_with(
-        "branch-livefses", options.launchpad_instance, version="devel")
+    args.launchpad = Launchpad.login_with(
+        "branch-livefses", args.launchpad_instance, version="devel")
 
-    distro = options.launchpad.distributions[options.distribution]
-    if options.source_series is None:
-        options.source_series = [
+    distro = args.launchpad.distributions[args.distribution]
+    if args.source_series is None:
+        args.source_series = [
             series for series in distro.series
             if series.status == "Current Stable Release"][0]
     else:
-        options.source_series = distro.getSeries(
-            name_or_version=options.source_series)
-    if options.dest_series is None:
-        options.dest_series = [
+        args.source_series = distro.getSeries(
+            name_or_version=args.source_series)
+    if args.dest_series is None:
+        args.dest_series = [
             series for series in distro.series
             if series.status == "Pre-release Freeze"][0]
     else:
-        options.dest_series = distro.getSeries(
-            name_or_version=options.dest_series)
+        args.dest_series = distro.getSeries(
+            name_or_version=args.dest_series)
 
-    owner = options.launchpad.people[args[0]]
+    owner = args.launchpad.people[args.owner]
 
-    branch_livefses(options, owner)
+    branch_livefses(args, owner)
 
 
 if __name__ == '__main__':

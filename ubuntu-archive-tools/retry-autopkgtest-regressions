@@ -31,7 +31,7 @@ import yaml
 import json
 
 request_url = 'https://autopkgtest.ubuntu.com/request.cgi'
-default_series = 'disco'
+default_series = 'groovy'
 args = None
 
 
@@ -65,10 +65,10 @@ def parse_args():
     parser.add_argument('--state', default='REGRESSION',
                         help='generate commands for given test state (default: %(default)s)')
     parser.add_argument('--max-age', type=float, metavar='DAYS',
-                        help='only consider candiates which are at most '
+                        help='only consider candidates which are at most '
                         'this number of days old (float allowed)')
     parser.add_argument('--min-age', type=float, metavar='DAYS',
-                        help='only consider candiates which are at least '
+                        help='only consider candidates which are at least '
                         'this number of days old (float allowed)')
     parser.add_argument('--blocks',
                         help='rerun only those tests that were triggered '

@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 
 # Copyright (C) 2011, 2012  Canonical Ltd.
 # Author: Martin Pitt <martin.pitt@canonical.com>
@@ -24,87 +24,429 @@ USAGE:
 from __future__ import print_function
 
 import argparse
+from contextlib import contextmanager
+from copy import copy
+from io import StringIO
 import sys
+import unittest
 
 from launchpadlib.launchpad import Launchpad
 
+from kernel_series import KernelSeries
+
+
+class TestBase(unittest.TestCase):
+    class FakeArgs:
+        def __init__(self, **kwargs):
+            self.testing = True
+            self.series = None
+            self.source = None
+            self.ppa2 = False
+            self.security = False
+            self.security2 = False
+            self.esm = False
+            self.fips = False
+            self.ibmgt = False
+            self.to_signing = False
+            self.from_signing = False
+            self.no_auto = False
+
+            self.update(**kwargs)
+
+        def update(self, **kwargs):
+            for (key, value) in kwargs.items():
+                setattr(self, key, value)
+            return self
+
+    @contextmanager
+    def capture(self):
+        new_out, new_err = StringIO(), StringIO()
+        old_out, old_err = sys.stdout, sys.stderr
+        try:
+            sys.stdout, sys.stderr = new_out, new_err
+            yield sys.stdout, sys.stderr
+        finally:
+            sys.stdout, sys.stderr = old_out, old_err
+
+    @classmethod
+    def setUpClass(cls):
+        data = """
+            defaults:
+                routing-table:
+                    default:
+                        security-build:
+                            - ['ppa:canonical-kernel-security-team/ubuntu/ppa', 'Release' ]
+                            - ['ppa:canonical-kernel-security-team/ubuntu/ppa2', 'Release' ]
+                        build:
+                            - ['ppa:canonical-kernel-team/ubuntu/ppa', 'Release' ]
+                        proposed:
+                            - ['ubuntu', 'Proposed' ]
+                    esm:
+                        security-build:
+                            - ['ppa:canonical-kernel-security-team/ubuntu/esm', 'Release']
+                        build:
+                            - ['ppa:canonical-kernel-esm/ubuntu/ppa', 'Release']
+                        signing:
+                            - ['ppa:canonical-signing/ubuntu/esm', 'Release']
+                        proposed:
+                            - ['ppa:canonical-kernel-esm/ubuntu/proposed', 'Release']
+            14.04:
+                codename: trusty
+                supported: true
+                esm: true
+                sources:
+                    linux:
+                        packages:
+                            linux:
+                            linux-signed:
+                                type: signed
+                            linux-meta:
+                                type: meta
+            16.04:
+                codename: xenial
+                supported: true
+                sources:
+                    linux-fips:
+                        routing:
+                            security-build:
+                                - ['ppa:canonical-kernel-security-team/ubuntu/ppa', 'Release']
+                                - ['ppa:canonical-kernel-security-team/ubuntu/ppa2', 'Release']
+                            build:
+                                - ['ppa:fips-cc-stig/ubuntu/fips-build', 'Release']
+                            signing:
+                                - ['ppa:canonical-signing/ubuntu/fips', 'Release']
+                            proposed:
+                                - ['ppa:ubuntu-advantage/ubuntu/fips-proposed', 'Release']
+                        packages:
+                            linux-fips:
+                            linux-meta-fips:
+                                type: meta
+                            linux-signed-fips:
+                                type: signed
+            18.04:
+                codename: bionic
+                supported: true
+                sources:
+                    linux:
+                        packages:
+                            linux:
+                            linux-signed:
+                                type: signed
+                            linux-meta:
+                                type: meta
+                    linux-ibm-gt:
+                        routing:
+                            security-build:
+                                - ['ppa:canonical-kernel-security-team/ubuntu/ppa', 'Release']
+                                - ['ppa:canonical-kernel-security-team/ubuntu/ppa2', 'Release']
+                            build:
+                                - ['ppa:ibm-cloud/ubuntu/build', 'Release']
+                            proposed:
+                                - ['ppa:ibm-cloud/ubuntu/proposed', 'Release']
+                        packages:
+                            linux-ibm-gt:
+                            linux-meta-ibm-gt:
+                                type: meta
+        """
+        cls.ks = KernelSeries(data=data)
+
+
+class TestRouting(TestBase):
+    def test_default(self):
+        expected = (['ppa:canonical-kernel-team/ubuntu/ppa', 'Release'], ['ubuntu', 'Proposed'], False)
+        result = routing(self.FakeArgs(series='bionic', source='linux'), self.ks)
+        self.assertEqual(expected, result)
+
+    def test_security(self):
+        expected = (['ppa:canonical-kernel-security-team/ubuntu/ppa', 'Release'], ['ubuntu', 'Proposed'], True)
+        result = routing(self.FakeArgs(series='bionic', source='linux', security=True), self.ks)
+        self.assertEqual(expected, result)
+
+    def test_security2(self):
+        expected = (['ppa:canonical-kernel-security-team/ubuntu/ppa2', 'Release'], ['ubuntu', 'Proposed'], True)
+        result = routing(self.FakeArgs(series='bionic', source='linux', security2=True), self.ks)
+        self.assertEqual(expected, result)
+
+    def test_to_signing(self):
+        expected = (['ppa:canonical-kernel-team/ubuntu/ppa', 'Release'], None, False)
+        result = routing(self.FakeArgs(series='bionic', source='linux', to_signing=True), self.ks)
+        self.assertEqual(expected, result)
+
+    def test_from_signing(self):
+        expected = (None, ['ubuntu', 'Proposed'], False)
+        result = routing(self.FakeArgs(series='bionic', source='linux', from_signing=True), self.ks)
+        self.assertEqual(expected, result)
+
+    def test_esm(self):
+        expected = (['ppa:canonical-kernel-esm/ubuntu/ppa', 'Release'], ['ppa:canonical-signing/ubuntu/esm', 'Release'], False)
+        result = routing(self.FakeArgs(series='trusty', source='linux'), self.ks)
+        self.assertEqual(expected, result)
+
+    def test_esm_security(self):
+        expected = (['ppa:canonical-kernel-security-team/ubuntu/esm', 'Release'], ['ppa:canonical-signing/ubuntu/esm', 'Release'], False)
+        result = routing(self.FakeArgs(series='trusty', source='linux', security=True), self.ks)
+        self.assertEqual(expected, result)
+
+    def test_esm_security2(self):
+        with self.assertRaises(SystemExit), self.capture() as (out, err):
+            expected = (None, ['ppa:canonical-kernel-esm/ubuntu/proposed', 'Release'], False)
+            result = routing(self.FakeArgs(series='trusty', source='linux', security2=True), self.ks)
+            self.assertEqual(expected, result)
+
+    def test_esm_to_signing(self):
+        expected = (['ppa:canonical-kernel-esm/ubuntu/ppa', 'Release'], ['ppa:canonical-signing/ubuntu/esm', 'Release'], False)
+        result = routing(self.FakeArgs(series='trusty', source='linux', esm=True, to_signing=True), self.ks)
+        self.assertEqual(expected, result)
+
+    def test_esm_from_signing(self):
+        expected = (['ppa:canonical-signing/ubuntu/esm', 'Release'], ['ppa:canonical-kernel-esm/ubuntu/proposed', 'Release'], False)
+        result = routing(self.FakeArgs(series='trusty', source='linux', esm=True, from_signing=True), self.ks)
+        self.assertEqual(expected, result)
+
+    # Autorouting will enable to_signing, the user will then want to switch us
+    # to from_signing in order to perform phase two copies.  To ensure this is
+    # simple we make from_signing take presidence over to_signing.  Test this
+    # is honoured correctly.
+    def test_esm_from_signing_override_to_signing(self):
+        expected = (['ppa:canonical-signing/ubuntu/esm', 'Release'], ['ppa:canonical-kernel-esm/ubuntu/proposed', 'Release'], False)
+        result = routing(self.FakeArgs(series='trusty', source='linux', esm=True, to_signing=True, from_signing=True), self.ks)
+        self.assertEqual(expected, result)
+
+    def test_fips(self):
+        expected = (['ppa:fips-cc-stig/ubuntu/fips-build', 'Release'], ['ppa:canonical-signing/ubuntu/fips', 'Release'], False)
+        result = routing(self.FakeArgs(series='xenial', source='linux-fips'), self.ks)
+        self.assertEqual(expected, result)
+
+    def test_fips_security(self):
+        expected = (['ppa:canonical-kernel-security-team/ubuntu/ppa', 'Release'], ['ppa:canonical-signing/ubuntu/fips', 'Release'], False)
+        result = routing(self.FakeArgs(series='xenial', source='linux-fips', security=True), self.ks)
+        self.assertEqual(expected, result)
+
+    def test_fips_security2(self):
+        expected = (['ppa:canonical-kernel-security-team/ubuntu/ppa2', 'Release'], ['ppa:canonical-signing/ubuntu/fips', 'Release'], False)
+        result = routing(self.FakeArgs(series='xenial', source='linux-fips', security2=True), self.ks)
+        self.assertEqual(expected, result)
+
+    def test_fips_to_signing(self):
+        expected = (['ppa:fips-cc-stig/ubuntu/fips-build', 'Release'], ['ppa:canonical-signing/ubuntu/fips', 'Release'], False)
+        result = routing(self.FakeArgs(series='xenial', source='linux-fips', to_signing=True), self.ks)
+        self.assertEqual(expected, result)
+
+    def test_fips_from_signing(self):
+        expected = (['ppa:canonical-signing/ubuntu/fips', 'Release'], ['ppa:ubuntu-advantage/ubuntu/fips-proposed', 'Release'], False)
+        result = routing(self.FakeArgs(series='xenial', source='linux-fips', from_signing=True), self.ks)
+        self.assertEqual(expected, result)
+
+    def test_ibmgt(self):
+        expected = (['ppa:ibm-cloud/ubuntu/build', 'Release'], ['ppa:ibm-cloud/ubuntu/proposed', 'Release'], False)
+        result = routing(self.FakeArgs(series='bionic', source='linux-ibm-gt'), self.ks)
+        self.assertEqual(expected, result)
+
+    def test_ibmgt_security(self):
+        expected = (['ppa:canonical-kernel-security-team/ubuntu/ppa', 'Release'], ['ppa:ibm-cloud/ubuntu/proposed', 'Release'], False)
+        result = routing(self.FakeArgs(series='bionic', source='linux-ibm-gt', security=True), self.ks)
+        self.assertEqual(expected, result)
+
+    def test_ibmgt_security2(self):
+        expected = (['ppa:canonical-kernel-security-team/ubuntu/ppa2', 'Release'], ['ppa:ibm-cloud/ubuntu/proposed', 'Release'], False)
+        result = routing(self.FakeArgs(series='bionic', source='linux-ibm-gt', security2=True), self.ks)
+        self.assertEqual(expected, result)
+
+
+def routing(args, ks):
+    series_name = args.series
+    package_name = args.source
+
+    series = ks.lookup_series(codename=series_name)
+    if series is None:
+        print("ERROR: {} -- series unknown".format(series_name))
+        sys.exit(1)
+
+    package = None
+    package_signed = None
+    for source_srch in series.sources:
+        package_signed = None
+        for package_srch in source_srch.packages:
+            if package_srch.name == package_name:
+                package = package_srch
+            if (package_srch.name.startswith('linux-signed-') or
+                    package_srch.name == 'linux-signed'):
+                package_signed = package_srch
+        if package is not None:
+            break
+    if package is None:
+        print("ERROR: {}/{} -- package unknown".format(series_name, package_name))
+        sys.exit(1)
+
+    source = package.source
+    routing = source.routing
+    if routing is None:
+        print("ERROR: {}/{} -- package has no routing".format(series_name, package_name))
+        sys.exit(1)
+
+    build_archives = routing.lookup_destination('build')
+    security_archives = routing.lookup_destination('security-build')
+    proposed_archive = routing.lookup_destination('proposed', primary=True)
+    signing_archive = routing.lookup_destination('signing', primary=True)
+
+    if build_archives is None or len(build_archives) < 1:
+        print("ERROR: {}/{} -- package has no primary build archive".format(series_name, package_name))
+        sys.exit(1)
+    if args.ppa2 and (build_archives is None or len(build_archives) < 2):
+        print("ERROR: {}/{} -- package has no secondary build archive".format(series_name, package_name))
+        sys.exit(1)
+    if build_archives is None:
+        print("ERROR: {}/{} -- package has no build archive".format(series_name, package_name))
+        sys.exit(1)
+    if proposed_archive is None:
+        print("ERROR: {}/{} -- package has no proposed archive".format(series_name, package_name))
+        sys.exit(1)
+    if args.security and (security_archives is None or len(security_archives) < 1):
+        print("ERROR: {}/{} -- package has no primary security archive".format(series_name, package_name))
+        sys.exit(1)
+    if args.security2 and (security_archives is None or len(security_archives) < 2):
+        print("ERROR: {}/{} -- package has no secondary security archive".format(series_name, package_name))
+        sys.exit(1)
+
+    # Default route build -> proposed
+    if args.ppa2:
+        from_archive = build_archives[1]
+    else:
+        from_archive = build_archives[0]
+    to_archive = proposed_archive
+
+    unembargo = False
+
+    # Handle security routing.
+    if args.security:
+        from_archive = security_archives[0]
+    if args.security2:
+        from_archive = security_archives[1]
+
+    # Allow us to unembargo when releasing from security to ubuntu.
+    if (args.security or args.security2) and to_archive[0] == 'ubuntu':
+        unembargo = True
+
+    # Handle signing routing.
+    if args.from_signing:
+        from_archive = signing_archive
+    elif args.to_signing:
+        to_archive = signing_archive
+    # Automatically route to signing by default.
+    elif args.no_auto is False and signing_archive is not None and package_signed is not None:
+        to_archive = signing_archive
+
+    # Announce the routing if needed.
+    if (args.testing is False and (routing.name != 'default' or from_archive == signing_archive or to_archive == signing_archive)):
+        msg = "NOTE: directing copy using {} routes".format(routing.name)
+        if from_archive == signing_archive:
+            msg += ' from signing'
+        elif to_archive == signing_archive:
+            msg += ' to signing'
+        print(msg)
+
+    return (from_archive, to_archive, unembargo)
+
+
+# SELF-TESTS:
+if len(sys.argv) >= 2 and sys.argv[1] == '--self-test':
+    unittest.main(argv=[sys.argv[0]] + sys.argv[2:])
+    sys.exit(0)
 
 parser = argparse.ArgumentParser(description='Copy a proposed kernel to the apropriate archive pocket')
+parser.set_defaults(testing=False)
 parser.add_argument('--dry-run', action='store_true', help='Do everything but actually copy the package')
+parser.add_argument('--ppa2', action='store_true', help='Copy from the kernel build PPA2')
 parser.add_argument('--security', '-S', action='store_true', help='Copy from the kernel security PPA')
 parser.add_argument('--security2', action='store_true', help='Copy from the kernel security PPA2')
 parser.add_argument('--esm', '-E', action='store_true', help='Copy from the kernel ESM PPA and to the kernel ESM proposed PPA')
+parser.add_argument('--fips', action='store_true', help='Copy from the kernel FIPS PPA and to the kernel FIPS proposed PPA')
+parser.add_argument('--ibmgt', action='store_true', help='Copy from the kernel IBM-GT build PPA to the corresponding proposed PPA')
 parser.add_argument('--no-auto', action='store_true', help='Turn off automatic detection of ESM et al based on series')
+parser.add_argument('--to-signing', action='store_true', help='Copy from the kernel ESM/FIPS PPA to the ESM/FIPS signing PPA')
+parser.add_argument('--from-signing', action='store_true', help='Copy from the ESM/FIPS signing PPA to the ESM/FIPS proposed PPA')
 parser.add_argument('series', action='store', help='The series the source package is in')
-parser.add_argument('source', action='store', help='The source package name')
+parser.add_argument('source', action='store', nargs='+', help='The source package name')
 
 args = parser.parse_args()
 
-to = 'ubuntu'
-ppa_name = '~canonical-kernel-team/ubuntu/ppa'
-security = False
+if args.esm or args.fips or args.ibmgt:
+    print("NOTE: flags --esm, --fips, and --ibmgt are now deprecated")
 
-# If we are allowed to intuit destinations do so:
-# 1) precise is now destined for the ESM PPAs
-if not args.no_auto:
-    if args.series == 'precise' and not args.esm:
-        print("NOTE: directing copy from and to ESM for precise")
-        args.esm = True
+release = args.series
 
-if args.esm:
-    ppa_name = '~canonical-kernel-esm/ubuntu/ppa'
-    to = '~canonical-kernel-esm/ubuntu/proposed'
-    to_pocket = 'release'
-if args.security:
-    ppa_name = '~canonical-kernel-security-team/ubuntu/ppa'
-    if not args.esm:
-        security = True
-    else:
-        ppa_name = '~canonical-kernel-security-team/ubuntu/esm'
-if args.security2:
-    ppa_name = '~canonical-kernel-security-team/ubuntu/ppa2'
-    if not args.esm:
-        security = True
-
-(release, pkg) = (args.series, args.source)
+ks = KernelSeries()
 
 launchpad = Launchpad.login_with(
     'ubuntu-archive-tools', 'production', version='devel')
 ubuntu = launchpad.distributions['ubuntu']
 distro_series = ubuntu.getSeries(name_or_version=release)
-kernel_ppa = launchpad.archives.getByReference(
-    reference=ppa_name)
 
-# get current version in PPA for that series
-versions = kernel_ppa.getPublishedSources(
-    source_name=pkg, exact_match=True, status='Published', pocket='Release',
-    distro_series=distro_series)
-assert versions.total_size == 1
-version = versions[0].source_package_version
+copies = []
+for pkg in list(args.source):
+    # BODGE: routing should just take release/pkg.
+    args.source = pkg
 
-include_binaries = (pkg not in ('debian-installer')
-                    and not pkg.startswith('linux-signed'))
+    (from_archive, to_archive, security) = routing(args, ks)
+    ##print("from_archive<{}> to_archive<{}>".format(from_archive, to_archive))
 
-# Grab a reference to the 'to' archive and select a pocket.
-to_archive = launchpad.archives.getByReference(reference=to)
-if to == 'ubuntu':
-    to_pocket = 'proposed'
-else:
-    to_pocket = 'release'
+    if from_archive is None:
+        print("ERROR: bad source PPA")
+        sys.exit(1)
+    if to_archive is None:
+        print("ERROR: bad destination")
+        sys.exit(1)
 
-print("""Copying {}/{}:
- From: {} release
- To: {} {}""".format(pkg, version, kernel_ppa, to_archive, to_pocket))
+    (from_reference, from_pocket) = from_archive
+    (to_reference, to_pocket) = to_archive
+
+    # Grab a reference to the 'from' archive.
+    from_archive = launchpad.archives.getByReference(
+        reference=from_reference)
+
+    # Grab a reference to the 'to' archive.
+    to_archive = launchpad.archives.getByReference(reference=to_reference)
+
+    # get current version in PPA for that series
+    versions = from_archive.getPublishedSources(
+        source_name=pkg, exact_match=True, status='Published', pocket=from_pocket,
+        distro_series=distro_series)
+    version = None
+    if versions.total_size == 1:
+        version = versions[0].source_package_version
+
+    include_binaries = (pkg not in ('debian-installer')
+                        and not pkg.startswith('linux-signed'))
+    if args.from_signing:
+        include_binaries = True
+
+    print("""Copying {}/{}:
+     From: {} {}
+     To: {} {}
+     Binaries: {}""".format(pkg, version, from_archive.reference, from_pocket, to_archive.reference, to_pocket, include_binaries))
+
+    if not version:
+        print("ERROR: no version to copy")
+        sys.exit(1)
+
+    copies.append({
+            'from_archive': from_archive,
+            'include_binaries': include_binaries,
+            'source_name': pkg,
+            'to_series': release,
+            'to_pocket': to_pocket,
+            'version': version,
+            'auto_approve': True,
+            'unembargo': security,
+        })
 
 if args.dry_run:
     print("Dry run; no packages copied.")
     sys.exit(0)
 
-# Finally ready to actually copy this.
-to_archive.copyPackage(
-    from_archive=kernel_ppa, include_binaries=include_binaries,
-    source_name=pkg, to_series=release, to_pocket=to_pocket, version=version,
-    auto_approve=True, unembargo=security)
+for copy in copies:
+    # We found valid packages for each requested element, actually copy them.
+    to_archive.copyPackage(**copy)
 
 # TODO: adjust this script to use find-bin-overrides or rewrite
 # find-bin-overrides to use lpapi and use it here.

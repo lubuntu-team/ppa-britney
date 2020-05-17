@@ -35,9 +35,10 @@ import subprocess
 import sys
 import tempfile
 try:
+    from urllib.parse import quote
     from urllib.request import urlopen, urlretrieve
 except ImportError:
-    from urllib import urlopen, urlretrieve
+    from urllib import urlopen, urlretrieve, quote
 import webbrowser
 
 from contextlib import ExitStack
@@ -126,7 +127,7 @@ def from_queue(options, archive, sourcepkg, series, version=None):
     queue = options.queue.title()
     queue_url = ('https://launchpad.net/ubuntu/%s/+queue?'
                  'queue_state=%s&batch=300&queue_text=%s' %
-                 (series.name, queues[queue], sourcepkg))
+                 (series.name, queues[queue], quote(sourcepkg)))
     uploads = [upload for upload in
                series.getPackageUploads(archive=archive, exact_match=True,
                                         name=sourcepkg, pocket='Proposed',
@@ -255,7 +256,7 @@ def reject_comment(launchpad, num, package, release, reason):
 
 if __name__ == '__main__':
 
-    default_release = 'cosmic'
+    default_release = 'focal'
     ppa_url = ('https://launchpad.net/~%s/+archive/ubuntu/%s/+packages?'
                'field.series_filter=%s')
 

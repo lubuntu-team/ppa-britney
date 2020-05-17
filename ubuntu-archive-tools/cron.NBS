@@ -20,7 +20,7 @@ set -e
 
 MIRROR=$HOME/mirror
 DISTRIBUTION="${DISTRIBUTION:-ubuntu}"
-RELEASE="${RELEASE:-disco}"
+RELEASE="${RELEASE:-groovy}"
 OUTDIR="${OUTDIR:-$HOME/public_html/NBS}"
 OUTFILE="${OUTFILE:-$HOME/public_html/nbs.html}"
 
@@ -42,6 +42,6 @@ checkrdepends -B "$MIRROR/$DISTRIBUTION" -s $RELEASE -b -d "$D" $CHECK
 
 rsync -a --delete "$D/" "$OUTDIR/"
 
-nbs-report -d "$DISTRIBUTION" -s "$RELEASE" --csv "${OUTFILE%.html}.csv" \
+nbs-report -B "$MIRROR/$DISTRIBUTION" -d "$DISTRIBUTION" -s "$RELEASE" --csv "${OUTFILE%.html}.csv" \
     "$OUTDIR/" >"$OUTFILE.new" && \
     mv "$OUTFILE.new" "$OUTFILE"

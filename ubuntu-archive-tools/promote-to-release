@@ -1,4 +1,4 @@
-#! /usr/bin/python
+#! /usr/bin/python2.7
 
 # Copyright (C) 2012  Canonical Ltd.
 # Author: Colin Watson <cjwatson@ubuntu.com>
@@ -34,16 +34,18 @@ def promote(options, name, version, architecture):
     else:
         display = "%s/%s/%s" % (name, version, architecture)
 
+    # check to see if the package and version has already been published or is
+    # pending publication
     if architecture is None:
         try:
             release_sources = options.archive.getPublishedSources(
                 source_name=name, version=version,
-                distro_series=options.series, pocket="Release",
+                distro_series=options.series, pocket=options.pocket.title(),
                 exact_match=True, status="Published")
         except IndexError:
             release_sources = options.archive.getPublishedSources(
                 source_name=name, version=version,
-                distro_series=options.series, pocket="Release",
+                distro_series=options.series, pocket=options.pocket.title(),
                 exact_match=True, status="Pending")
         except HTTPError as e:
             print("getPublishedSources %s: %s" % (display, e.content),
@@ -60,12 +62,16 @@ def promote(options, name, version, architecture):
         sys.stdout.flush()
 
     try:
+        percentage = None
+        if options.pocket == 'updates':
+            percentage = 10
         options.archive.copyPackage(
             source_name=name, version=version,
             from_archive=options.archive,
             from_series=options.series.name, from_pocket="Proposed",
-            to_series=options.series.name, to_pocket="Release",
+            to_series=options.series.name, to_pocket=options.pocket.title(),
             include_binaries=True, sponsored=options.requestor,
+            phased_update_percentage=percentage,
             auto_approve=True)
     except HTTPError as e:
         print("copyPackage %s: %s" % (display, e.content), file=sys.stderr)
@@ -87,7 +93,8 @@ def promote(options, name, version, architecture):
 
     if architecture is None:
         try:
-            proposed_source.requestDeletion(removal_comment="moved to release")
+            proposed_source.requestDeletion(removal_comment="moved to %s" %
+                                            options.pocket)
         except HTTPError as e:
             print("requestDeletion %s: %s" % (display, e.content),
                   file=sys.stderr)
@@ -102,7 +109,8 @@ def promote(options, name, version, architecture):
                 if architecture != "i386":
                     continue
             try:
-                bpph.requestDeletion(removal_comment="moved to release")
+                bpph.requestDeletion(removal_comment="moved to %s" %
+                                     options.pocket)
             except HTTPError as e:
                 print("requestDeletion %s/%s/%s: %s" %
                       (bpph.binary_package_name, bpph.binary_package_version,
@@ -173,9 +181,15 @@ def main():
     parser.add_option(
         "-s", "--series", dest="suite",
         metavar="SERIES", help="promote from SERIES-proposed to SERIES")
+    parser.add_option(
+        "-p", "--pocket", default="release",
+        help="the pocket to which the package should be copied")
     options, args = parser.parse_args()
     if len(args) != 1:
         parser.error("need britney output delta file")
+    if options.pocket not in ('updates', 'release'):
+        parser.error("pocket must be updates or release not %s" %
+                     options.pocket)
 
     options.launchpad = Launchpad.login_with(
         "promote-to-release", options.launchpad_instance, version="devel")

@@ -27,7 +27,8 @@ class KernelWorkflowError(Exception):
 
 def get_name_and_version_from_bug(bug):
     title_re = re.compile(
-        r'^(?P<package>[a-z0-9.-]+): (?P<version>[0-9.-]+[0-9a-z.~-]*)'
+        r'^([a-z]+\/)?(?P<package>[a-z0-9.-]+): '
+        + '(?P<version>[0-9.-]+[0-9a-z.~-]*)'
         + ' -proposed tracker$')
     match = title_re.search(bug.title)
     if not match:
@@ -93,7 +94,8 @@ def process_sru_bug(lp, bugnum, task_callback, source_callback, context=None):
     if source_name != package:
         print("Cannot determine base package for %s, %s vs. %s"
               % (bugnum, source_name, package))
-        return
+        if context['skipnamecheck']:
+            return
 
     if not packages:
         print("No packages in the prepare list, don't know what to do")
@@ -101,7 +103,7 @@ def process_sru_bug(lp, bugnum, task_callback, source_callback, context=None):
 
     if not '' in packages:
         print("No kernel package in prepare list, only meta packages.  "
-              "Continue review? [yN] ", end="")
+              "Continue? [yN] ", end="")
         sys.stdout.flush()
         response = sys.stdin.readline()
         if not response.strip().lower().startswith('y'):
@@ -110,7 +112,9 @@ def process_sru_bug(lp, bugnum, task_callback, source_callback, context=None):
     full_packages = []
     for pkg in packages:
         if pkg == '-lbm':
-           pkg = '-backports-modules-3.2.0'
+            pkg = '-backports-modules-3.2.0'
+        elif pkg == '-lrm':
+            pkg = '-restricted-modules'
 
         real_package = re.sub(r'^linux', 'linux' + pkg, package)
         full_packages.append(real_package)

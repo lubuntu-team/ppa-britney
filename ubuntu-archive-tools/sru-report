@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 
 # Copyright (C) 2009, 2010, 2011, 2012  Canonical Ltd.
 # Authors:
@@ -159,6 +159,20 @@ def bug_open_js(bugs, title=None):
     return '<button onclick="%s">%s (%i)</button>' % (js, title, len(bugs))
 
 
+def verification_failed_check_for_removal(activities, release):
+    '''Helper function, checking if the verification-failed bug qualifies the
+       upload for removal'''
+    for activity in reversed(activities):
+        if (activity.whatchanged == 'tags' and
+                'verification-failed-%s' % release in activity.newvalue):
+            age = (datetime.datetime.now() - activity.datechanged.replace(
+                tzinfo=None)).days
+            if age >= 10:
+                return True
+            break
+    return False
+
+
 def print_report(srus):
     '''render the report'''
     global releases
@@ -192,6 +206,7 @@ def print_report(srus):
     a.testing { color: blue; }
     a.broken { text-decoration: line-through; color: black; }
     a.removal { color: gray; font-weight: bold }
+    a.blockproposed:after { content: "\\1F6A7"; font-weight: normal; }
   </style>
 </head>
 <body>
@@ -229,7 +244,10 @@ bugs in <span style="font-style: italic">italic</span> are kernel tracking
 bugs and bugs that are
 <span style="text-decoration: line-through;">struck through</span> are
 duplicate bug reports or weren't accessible at the time the report was
-generated.</p>''')
+generated. Bugs with the &#x1F6A7; character next to their number are bugs with
+a block-proposed-SERIES tag, indicating that they should not be released 
+without double-checking the bug contents. Those can be staged in -proposed, 
+even when verified, for a reason.</p>''')
 
     #
     # pending SRUs
@@ -240,13 +258,14 @@ generated.</p>''')
     pkgcleanup_release = []
     pkgsuperseded = []
     # set of (series_name, srcpkg, [bugs])
-    proposed_antique = []
+    proposed_ancient = []
+    proposed_failed = []
     for release in sorted(srus):
         if not srus[release]:
             continue
         for pack in srus[release]:
             pkg_index[release][pack] = srus[release][pack]['published']
-        for pkg, pub in sorted(pkg_index[release].iteritems(),
+        for pkg, pub in sorted(pkg_index[release].items(),
                                key=itemgetter(1)):
             rpkg = srus[release][pkg]
             if cleanup(rpkg):
@@ -273,20 +292,26 @@ generated.</p>''')
   <tr><th>Package</th><th>-release</th><th>-updates</th>
   <th>-proposed (signer, creator)</th>
   <th>changelog bugs</th><th>days</th></tr>''' % (release, release))
-        for pkg, pub in sorted(pkg_index[release].iteritems(),
+        for pkg, pub in sorted(pkg_index[release].items(),
                                key=itemgetter(1)):
             # skip everything that shows up on the kernel SRU reports
-            if (pkg in ('linux', 'linux-hwe', 'linux-hwe-edge',
-                        'linux-kvm', 'linux-oem',
-                        'linux-raspi2', 'linux-snapdragon',
+            if (pkg in ('linux', 'linux-hwe', 'linux-hwe-edge', 'linux-hwe-5.0',
+                        'linux-kvm', 'linux-oem', 'linux-oem-osp1',
+                        'linux-raspi2', 'linux-raspi2-5.3',
+                        'linux-snapdragon', 'linux-bluefield',
                         'linux-keystone', 'linux-armadaxp', 'linux-ti-omap4',
-                        'linux-aws', 'linux-aws-hwe', 'linux-aws-edge',
-                        'linux-azure', 'linux-azure-edge',
-                        'linux-gcp', 'linux-gcp-edge',
-                        'linux-gke', 'linux-euclid', 'linux-oracle') or
+                        'linux-aws', 'linux-aws-5.0', 'linux-aws-5.3',
+                        'linux-aws-hwe', 'linux-aws-edge',
+                        'linux-azure', 'linux-azure-edge', 'linux-azure-5.3',
+                        'linux-gcp', 'linux-gcp-5.3', 'linux-gcp-edge',
+                        'linux-gke', 'linux-gke-4.15', 'linux-gke-5.0',
+                        'linux-gke-5.3',
+                        'linux-euclid', 'linux-oracle', 'linux-oracle-5.0',
+                        'linux-oracle-5.3') or
                     pkg.startswith('linux-signed') or
                     pkg.startswith('linux-meta') or
                     pkg.startswith('linux-lts') or
+                    pkg.startswith('linux-restricted-modules') or
                     pkg.startswith('linux-backports-modules')):
                 continue
             # for langpack updates, only keep -en as a representative
@@ -331,14 +356,17 @@ generated.</p>''')
                   (pkgurl + rpkg['proposed'], rpkg['proposed'], uploaders))
             print('  <td>')
             removable = True
-            antique = False
-            for b, t in sorted(rpkg['bugs'].iteritems()):
+            ancient = False
+            failed_and_removable = False
+            for b, t in sorted(rpkg['bugs'].items()):
                 cls = ' class="'
                 incomplete = False
+                activities = None
                 try:
                     bug = lp.bugs[b]
-                    bug_title = bug.title.encode('UTF-8')
+                    bug_title = bug.title
                     hover_text = bug_title
+                    activities = bug.activity
                     for task in bug.bug_tasks:
                         if task.self_link.split('/')[4] != 'ubuntu':
                             continue
@@ -362,6 +390,12 @@ generated.</p>''')
                 elif ('verification-failed' in t or
                         'verification-failed-%s' % release in t):
                     cls += ' verificationfailed'
+                    # Check if the SRU was in verification-failed for long
+                    # enough to be considered for removal.
+                    if not failed_and_removable and activities:
+                        failed_and_removable = \
+                            verification_failed_check_for_removal(
+                                activities, release)
                 elif 'verification-done-%s' % release in t:
                     cls += ' verified'
                     removable = False
@@ -387,7 +421,7 @@ generated.</p>''')
                                 if (m_date.replace(tzinfo=None) < today
                                         - datetime.timedelta(16)):
                                     cls += ' removal'
-                                    antique = True
+                                    ancient = True
                                     continue
                                 if 'messages' in cls:
                                     cls = cls.replace('messages', '')
@@ -401,23 +435,29 @@ generated.</p>''')
                                         bug_title, \
                                         datetime.datetime.strftime(
                                             m_date, '%Y-%m-%d'))
-                                    hover_text += message.content.encode(
-                                        'UTF-8') + ' - '
-                                    hover_text += m_owner.name.encode(
-                                        'UTF-8')
-                                    antique = False
+                                    hover_text += message.content + ' - '
+                                    hover_text += m_owner.name
+                                    ancient = False
                             except ClientError as error:
                                 # people who don't use lp anymore
                                 if error.response['status'] == '410':
                                     continue
+                # We now also try handling block-proposed tags for updates
+                # that can be verified but should not be released yet for
+                # some reasons.
+                if 'block-proposed-%s' % release in t:
+                    cls += ' blockproposed'
                 cls += '"'
 
                 print('<a href="%s/bugs/%d" '
                       'title="%s" %s>%d%s</a>' %
                       (lp_url, b, hover_text.replace('"', ''), cls, b,
                        '(hw)' if 'hw-specific' in t else ''))
-            if antique and removable:
-                proposed_antique.append((releases[release].name, pkg,
+            if failed_and_removable:
+                proposed_failed.append((releases[release].name, pkg,
+                                       [str(b) for b in rpkg['bugs']]))
+            elif ancient and removable:
+                proposed_ancient.append((releases[release].name, pkg,
                                         [str(b) for b in rpkg['bugs']]))
             print('&nbsp;</td>')
             print('  <td>%i</td></tr>' % age)
@@ -501,12 +541,24 @@ generated.</p>''')
                     '-e %s %s' % (r, pkg[2]['proposed'], pkg[1]))
     print('</pre>')
 
+    print('<p>The following packages have bugs that have failed '
+          'verification for more than 10 days and should be removed from '
+          '-proposed:</p>')
+
+    print('<pre>')
+    for r in releases:
+        for pkg in sorted(proposed_failed):
+            if pkg[0].startswith(r):
+                print('sru-remove --reason=failed -s %s -p %s %s' %
+                      (r, pkg[1], ' '.join(pkg[2])))
+    print('</pre>')
+
     print('<p>The following packages have not had their SRU bugs verified in '
           '105 days and should be removed from -proposed:</p>')
 
     print('<pre>')
     for r in releases:
-        for pkg in sorted(proposed_antique):
+        for pkg in sorted(proposed_ancient):
             if pkg[0].startswith(r):
                 print('sru-remove -s %s -p %s %s' %
                       (r, pkg[1], ' '.join(pkg[2])))
@@ -554,7 +606,7 @@ def match_srubugs(changesfileurls):
         changelog = urlopen(changesfileurl)
         bugnums = []
         for l in changelog:
-            if l.startswith('Launchpad-Bugs-Fixed: '):
+            if l.startswith(b'Launchpad-Bugs-Fixed: '):
                 bugnums = [int(b) for b in l.split()[1:]]
                 break
 
@@ -630,7 +682,7 @@ def get_srus():
         if release != 'lucid':
             excuses_page = excuses_url % release
             excuses = urlopen(excuses_page)
-            excuses_data = yaml.load(excuses)
+            excuses_data = yaml.load(excuses, Loader=yaml.CSafeLoader)
             pkg_excuses = [excuse['source']
                            for excuse in excuses_data['sources']
                            if 'autopkgtest' in excuse['reason']
@@ -708,6 +760,10 @@ def bugs_from_changes(change_url):
 
 
 def main():
+    # Force encoding to UTF-8 even in non-UTF-8 locales.
+    import io, sys
+    sys.stdout = io.TextIOWrapper(
+        sys.stdout.detach(), encoding="UTF-8", line_buffering=True)
     logging.basicConfig(level=DEBUGLEVEL,
                         format="%(asctime)s - %(levelname)s - %(message)s")
     lpinit()

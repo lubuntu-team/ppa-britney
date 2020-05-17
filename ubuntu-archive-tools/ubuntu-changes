@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-DIST="${DIST:-disco}"
+DIST="${DIST:-groovy}"
 
 MADISON="$(rmadison -a source -s "$DIST" "$1")"
 [ "$MADISON" ] || exit 1
@@ -51,7 +51,7 @@ wget -q -O- http://changelogs.ubuntu.com/changelogs/pool/$SECTION/$POOLINDEX/$1/
 			target="${target%;}"
 			target="${target%%-*}"
 			case $target in
-				warty|hoary|breezy|dapper|edgy|feisty|gutsy|hardy|intrepid|jaunty|karmic|lucid|maverick|natty|oneiric|precise|quantal|raring|saucy|trusty|utopic|vivid|wily|xenial|yakkety|zesty|artful|bionic|cosmic|disco|devel)
+				warty|hoary|breezy|dapper|edgy|feisty|gutsy|hardy|intrepid|jaunty|karmic|lucid|maverick|natty|oneiric|precise|quantal|raring|saucy|trusty|utopic|vivid|wily|xenial|yakkety|zesty|artful|bionic|cosmic|disco|eoan|focal|groovy|devel)
 					;;
 				*)
 					exit 0

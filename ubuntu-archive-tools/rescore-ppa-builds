@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python2.7
 # Rescore all builds in a PPA.
 #
 # Copyright (C) 2012  Canonical Ltd.

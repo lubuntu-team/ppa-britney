@@ -118,8 +118,16 @@ def generate_diff_from_master(me, archive, master_source, master_version,
         sys.stdin.readline()
         return
 
+    # we need to pull in the master kernel into a separate directory as
+    # it might have the same name (flavor) as the one we are reviewing
+    master_dir = os.path.join(work_dir, 'master')
+    os.mkdir(master_dir)
+    # this is a bit ugly, since we actually have to chdir for a moment
+    # because dget has no option of declaring the output directory
+    os.chdir(master_dir)
+
     fetch_tarball_from_cache(
-        work_dir, tardir, master_source, master_upstream, start_dir)
+        master_dir, tardir, master_source, master_upstream, start_dir)
 
     # grab the old source first
     dget_cmd = ['dget', '-u', master_dsc]
@@ -130,11 +138,14 @@ def generate_diff_from_master(me, archive, master_source, master_version,
               (master_source, master_version))
         raise e
 
+    os.chdir(work_dir)
+
     # generate the diff
+    master_path = os.path.join(master_dir, master_source)
     print("Generating brief diff between new kernel and master (%s) to %s" %
           (master_version, os.path.join(work_dir, 'master_diff')))
-    diff_cmd = ('diff -rq "{}-{}" "{}-{}" >master_diff').format(
-        master_source, master_upstream, new_source, new_upstream)
+    diff_cmd = ('diff -rq --label master "{}-{}" "{}-{}" >master_diff').format(
+        master_path, master_upstream, new_source, new_upstream)
     subprocess.call(diff_cmd, shell=True)
 
 
@@ -168,12 +179,13 @@ def review_source_callback(lp, bugnum, tasks, full_packages, release, context):
     master_version = None
     if context['diff']:
         master_source, master_version = get_master_kernel(lp, bugnum)
+    should_sign = any('-signed' in pkg for pkg in full_packages)
     for source in full_packages:
         process_source_package(
             source, release, me, context['archive'], context['ppa'],
             context['ubuntu'], context['startdir'], context['workdir'],
             context['tardir'], context['esm'], context['tarcache'],
-            master_source, master_version)
+            master_source, master_version, should_sign)
     tasks['proposed'].status = 'Fix Committed'
     tasks['proposed'].assignee = me
     tasks['proposed'].lp_save()
@@ -222,7 +234,8 @@ def save_tarball_to_cache(directory, tardir, source, version):
 def process_source_package(source, release, me, archive, ppa, ubuntu,
                            start_dir, work_dir, tardir,
                            esm=False, tar_cache=False,
-                           master_source=None, master_version=None):
+                           master_source=None, master_version=None,
+                           should_sign=False):
     series = ubuntu.getSeries(name_or_version=release)
 
     ppa_src = ppa.getPublishedSources(order_by_date=True,
@@ -316,7 +329,8 @@ def process_source_package(source, release, me, archive, ppa, ubuntu,
         save_tarball_to_cache(work_dir, tardir, source, new_upstream)
 
     if (master_source and master_version and
-            '-meta' not in source and '-signed' not in source):
+            '-meta' not in source and '-signed' not in source and
+            '-restricted-modules' not in source):
         # if requested, we also generate a brief diff between the new kernel
         # and its 'master' kernel
         generate_diff_from_master(
@@ -349,35 +363,55 @@ def process_source_package(source, release, me, archive, ppa, ubuntu,
                   (source, ppa_ver))
             raise e
         print("Accepted")
+        # we only care about accepting signed bits if there is a -signed
+        # package in the handled sources and when we're not working with
+        # ESM (as those don't go through the queue)
+        if not should_sign or esm:
+            return
         # we know this isn't a kernel package containing signed bits,
         # so don't subject ourselves to extra delays
-        if '-meta' in source or '-signed' in source:
+        if ('-meta' in source or '-signed' in source or
+                '-restricted-modules' in source):
             return
-        print("Checking for UEFI binaries")
-        # Arbitrary 10 second delay, maybe enough to let uefi binaries hit
-        # the unapproved queue.
-        time.sleep(10)
-        # accept any related uefi binaries.  We filter as closely as possible
-        # on name without hard-coding architecture, and we also filter to
-        # only include uefi binaries that have appeared since we started the
-        # copy to avoid accepting something that might have been improperly
-        # copied into the queue by an "attacker" with upload rights.
+        print("Checking for UEFI binaries in the Unapproved queue")
         uefis = []
-        for signed_type in ('uefi', 'signing'):
-            uefis.extend(series.getPackageUploads(
-                archive=archive['release'],
-                pocket='Proposed',
-                status='Unapproved',
-                custom_type=signed_type,
-                name='{}_{}_'.format(source, ppa_ver),
-                created_since_date=copy_time))
-        for uefi in uefis:
-            print("Accepting {}".format(uefi))
-            uefi.acceptFromQueue()
+        # we try looking for signed bits a few times after short, constant
+        # delays.  The binaries nowadays appear after some seconds, but
+        # having a constant delay is suboptimal.
+        for n in range(5):
+            time.sleep(3)
+            # accept any related uefi binaries.  We filter as closely as
+            # possible on name without hard-coding architecture, and we also
+            # filter to only include uefi binaries that have appeared since we
+            # started the copy to avoid accepting something that might have
+            # been improperly copied into the queue by an "attacker" with
+            # upload rights.
+            for signed_type in ('uefi', 'signing'):
+                uefis.extend(series.getPackageUploads(
+                    archive=archive['release'],
+                    pocket='Proposed',
+                    status='Unapproved',
+                    custom_type=signed_type,
+                    name='{}_{}_'.format(source, ppa_ver),
+                    created_since_date=copy_time))
+
+            if uefis:
+                for uefi in uefis:
+                    print("Accepting {}".format(uefi))
+                    uefi.acceptFromQueue()
+                break
+        else:
+            print("No UEFI binaries found after %s tries.  Please manually "
+                  "check for their existance and approve before accepting the "
+                  "signed sources." % n)
+            print("Press enter to continue.")
+            sys.stdout.flush()
+            sys.stdin.readline()
+
 
 if __name__ == '__main__':
 
-    default_release = 'cosmic'
+    default_release = 'focal'
 
     parser = OptionParser(
         usage="Usage: %prog [options] bug [bug ...]")
@@ -398,6 +432,9 @@ if __name__ == '__main__':
         "-e", "--esm", dest="esm", action="store_true")
     parser.add_option(
         "-d", "--diff-against-master", dest="diff_master",
+        action="store_true")
+    parser.add_option(
+        "--skip-name-check", dest="nonamecheck",
         action="store_true")
 
     opts, bugs = parser.parse_args()
@@ -440,7 +477,8 @@ if __name__ == '__main__':
     context = {
       'archive': archive, 'ppa': ppa, 'ubuntu': ubuntu,
       'tardir': tardir, 'tarcache': opts.caching, 'startdir': start_dir,
-      'esm': opts.esm, 'diff': opts.diff_master
+      'esm': opts.esm, 'diff': opts.diff_master,
+      'skipnamecheck': opts.nonamecheck
       }
     for bugnum in bugs:
         with ExitStack() as resources:

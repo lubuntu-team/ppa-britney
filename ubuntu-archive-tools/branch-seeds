@@ -1,4 +1,4 @@
-#! /usr/bin/python
+#! /usr/bin/python2.7
 
 # Copyright (C) 2012  Canonical Ltd.
 # Author: Colin Watson <cjwatson@ubuntu.com>
@@ -22,6 +22,7 @@ from __future__ import print_function
 from optparse import OptionParser
 import os
 import re
+import time
 import subprocess
 try:
     from urllib.parse import urlparse
@@ -134,8 +135,18 @@ def branch(options, collection):
                 if "git.launchpad.net" in remote:
                     lp_git_repo = options.launchpad.git_repositories.getByPath(
                         path=urlparse(remote).path.lstrip("/"))
-                    lp_git_repo.default_branch = options.dest_series
-                    lp_git_repo.lp_save()
+                    new_ref = "refs/heads/%s" % options.dest_series
+                    # Sometimes it takes LP a while to notice the new ref
+                    for i in range(10):
+                        if lp_git_repo.getRefByPath(path=new_ref):
+                            lp_git_repo.default_branch = new_ref
+                            lp_git_repo.lp_save()
+                            break
+                        time.sleep(1)
+                    else:
+                        raise Exception(
+                            "Was unable to set default_branch of %s after "
+                            "multiple retries - proceed manually." % remote)
                 else:
                     raise Exception(
                         "Git remote URL must be on git.launchpad.net.")

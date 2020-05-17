@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python2.7
 # -*- coding: utf-8 -*-
 
 # Copyright (C) 2010, 2011, 2012  Canonical Ltd.
@@ -54,8 +54,8 @@ product_re = re.compile(
     '(alternate|desktop|dvd|server(?: subiquity)?|mobile|base|active|wubi)(?: preinstalled)? '
     '(i386|amd64$|amd64\+mac|armel$|armel\+dove|armel\+omap$|armel\+omap4|'
     'armel\+ac100|armel\+mx5|armhf$|armhf\+omap$|armhf\+omap4|armhf\+ac100|'
-    'armhf\+mx5|armhf\+nexus7|armhf\+raspi2|armhf\+raspi3|arm64$|arm64\+raspi3|'
-    'powerpc|ppc64el|s390x)', re.I)
+    'armhf\+mx5|armhf\+nexus7|armhf\+raspi$|armhf\+raspi2|armhf\+raspi3|'
+    'arm64$|arm64\+raspi$|arm64\+raspi3|powerpc|ppc64el|s390x)', re.I)
 
 # map an image type from the ISO tracker to a source directory for
 # publish-release
@@ -67,6 +67,7 @@ type_map = {
     'mobile': 'daily-live',
     'active': 'daily-live',
     'server': 'daily',
+    'legacy-server': 'daily',    
     'base': 'daily',
     'wubi': 'wubi',
     'preinstalled-desktop': 'daily-preinstalled',
@@ -171,11 +172,19 @@ def parse_iso_tracker(opts):
             type = 'preinstalled-%s' % type
         if 'Server arm64+raspi3' in product:
             type = 'preinstalled-%s' % type
+        if 'Server armhf+raspi' in product:
+            type = 'preinstalled-%s' % type
+        if 'Server arm64+raspi' in product:
+            type = 'preinstalled-%s' % type
         if 'Server Subiquity' in product:
             type = 'live-server'
             project = 'ubuntu'
         if 'Preinstalled' in product:
             type = 'preinstalled-%s' % type
+        if (ms.series_string == u'Focal' and
+            project == 'ubuntu' and type == 'server'):
+            project = 'ubuntu-server'
+            type = 'legacy-server'
         if project == 'kubuntu' and type == 'mobile':
             project = 'kubuntu-mobile'
         if project == 'kubuntu' and type == 'active':

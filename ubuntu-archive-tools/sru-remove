@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python2.7
 
 # Copyright (C) 2015 Brian Murray <brian.murray@canonical.com>
 
@@ -50,13 +50,19 @@ def parse_options():
         help="release (default: %s)" % default_release)
     parser.add_option(
         "-p", "--package", dest="sourcepkg")
+    parser.add_option(
+        "--reason", dest="reason", default="ancient",
+        help="reason for removal: ancient, failed (default: ancient)")
 
     opts, args = parser.parse_args()
+
+    if opts.reason not in ('ancient', 'failed'):
+        parser.error('Reason can only be "ancient" or "failed".')
 
     return (opts, args)
 
 
-def process_bug(launchpad, distroseries, sourcepkg, num):
+def process_bug(launchpad, distroseries, sourcepkg, num, reason):
     bug_target_re = re.compile(
         r'/ubuntu/(?:(?P<suite>[^/]+)/)?\+source/(?P<source>[^/]+)$')
     bug = launchpad.bugs[num]
@@ -92,11 +98,19 @@ def process_bug(launchpad, distroseries, sourcepkg, num):
             bug.tags = tags
             bug.lp_save()
 
-        text = ('The version of %s in the proposed pocket of %s that was '
-                'purported to fix this bug report has been removed because '
-                'the bugs that were to be fixed by the upload were not '
-                'verified in a timely (105 days) fashion.' %
-                (sourcepkg, series_name.title()))
+        if reason == 'failed':
+            text = ('The version of %s in the proposed pocket of %s that was '
+                    'purported to fix this bug report has been removed '
+                    'because one or more bugs that were to be fixed by the '
+                    'upload have failed verification and been in this state '
+                    'for more than 10 days.' %
+                    (sourcepkg, series_name.title()))
+        else:  # 'ancient'
+            text = ('The version of %s in the proposed pocket of %s that was '
+                    'purported to fix this bug report has been removed '
+                    'because the bugs that were to be fixed by the upload '
+                    'were not verified in a timely (105 days) fashion.' %
+                    (sourcepkg, series_name.title()))
         bug.newMessage(content=text,
                        subject='Proposed package removed from archive')
 
@@ -117,11 +131,16 @@ def process_bug(launchpad, distroseries, sourcepkg, num):
 
 if __name__ == '__main__':
 
-    default_release = 'cosmic'
-    removal_comment = ('The package was removed due to its SRU bug(s) '
-                       'not being verified in a timely fashion.')
+    default_release = 'focal'
 
     (opts, bugs) = parse_options()
+
+    if opts.reason == 'failed':
+        removal_comment = ('The package was removed due to one or more of '
+                           'its SRU bugs having failed verification.')
+    else:  # 'ancient'
+        removal_comment = ('The package was removed due to its SRU bug(s) '
+                           'not being verified in a timely fashion.')
 
     launchpad = Launchpad.login_with('sru-remove', opts.launchpad_instance,
                                      version="devel")
@@ -156,4 +175,4 @@ if __name__ == '__main__':
         sys.exit(1)
     # only comment on the bugs after removing the package
     for bug in bugs:
-        process_bug(launchpad, series, opts.sourcepkg, bug)
+        process_bug(launchpad, series, opts.sourcepkg, bug, opts.reason)

@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
 # Copyright (C) 2008, 2009, 2010, 2011, 2012  Canonical Ltd.
@@ -24,7 +24,7 @@
 
 from __future__ import print_function
 
-from optparse import OptionParser, SUPPRESS_HELP
+import argparse
 import sys
 
 import launchpadlib.errors
@@ -74,44 +74,45 @@ def multiline_input(prompt):
         buf.append(line)
 
 
-def get_archive(options, launchpad):
+def get_archive(args, launchpad):
     # We default to looking up by archive reference (ubuntu,
     # ubuntu/partner or ~owner/ubuntu/ppa).
-    if options.archive is not None:
-        archive = launchpad.archives.getByReference(reference=options.archive)
+    if args.archive is not None:
+        archive = launchpad.archives.getByReference(reference=args.archive)
         if archive is not None:
             return archive
 
     # But we also still support combining a distro name in -d and an
     # archive name or old PPA reference in -A (-d ubuntu,
     # -d ubuntu -A partner, or -d ubuntu -A owner/ppa).
-    distro = launchpad.distributions[options.distro]
-    if options.archive is None:
+    distro = launchpad.distributions[args.distro]
+    if args.archive is None:
         return distro.main_archive
     else:
-        if '/' in options.archive:
-            owner, ppa_name = options.archive.split('/')
+        if '/' in args.archive:
+            owner, ppa_name = args.archive.split('/')
             return launchpad.people[owner].getPPAByName(
                 distribution=distro, name=ppa_name)
         for archive in distro.archives:
-            if archive.name == options.archive:
+            if archive.name == args.archive:
                 return archive
-    raise AssertionError("No such archive in Ubuntu: %s" % options.archive)
+    raise AssertionError("No such archive in Ubuntu: %s" % args.archive)
 
 
-def get_source_components(options, launchpad, archive, source):
+def get_source_components(args, launchpad, archive, source):
     try:
         from debian import debian_support
     except ImportError:
         from debian_bundle import debian_support
 
-    args = {}
-    if options.series:
-        args['distro_series'] = options.series
+    kwargs = {}
+    if args.series:
+        kwargs['distro_series'] = args.series
 
     newest = {}
     for spph in archive.getPublishedSources(
-            source_name=source, exact_match=True, status='Published', **args):
+            source_name=source, exact_match=True, status='Published',
+            **kwargs):
         if not spph.distro_series.active:
             continue
         new_version = debian_support.Version(spph.source_package_version)
@@ -128,15 +129,15 @@ permission_names = dict(upload='Archive Upload Rights',
                         admin='Queue Administration Rights')
 
 
-def do_query(options):
+def do_query(args):
     """Query existing permissions and show on stdout."""
-    if options.archive.self_link == options.distro.main_archive_link:
-        archives = options.distro.archives
+    if args.archive.self_link == args.distro.main_archive_link:
+        archives = args.distro.archives
     else:
-        archives = [options.archive]
+        archives = [args.archive]
 
-    if options.person:
-        for person in options.person:
+    if args.person:
+        for person in args.person:
             if '@' in person:
                 lp_person = launchpad.people.getByEmail(email=person)
             else:
@@ -149,29 +150,29 @@ def do_query(options):
             for archive in archives:
                 perms.extend(archive.getPermissionsForPerson(
                     person=lp_person))
-            if options.acl_type:
-                perm_name = permission_names[options.acl_type]
+            if args.acl_type:
+                perm_name = permission_names[args.acl_type]
                 perms = [p for p in perms if p.permission == perm_name]
             print("== All rights for %s ==" % lp_person.name)
-            print_perms(perms, options.series)
+            print_perms(perms, args.series)
 
-    if options.component:
+    if args.component:
         perms = []
-        if not options.acl_type or options.acl_type == 'upload':
+        if not args.acl_type or args.acl_type == 'upload':
             for archive in archives:
                 perms.extend(archive.getUploadersForComponent(
-                    component_name=options.component))
-        if not options.acl_type or options.acl_type == 'admin':
+                    component_name=args.component))
+        if not args.acl_type or args.acl_type == 'admin':
             for archive in archives:
                 perms.extend(archive.getQueueAdminsForComponent(
-                    component_name=options.component))
-        print("== All rights for component '%s' ==" % options.component)
-        print_perms(perms, options.series)
+                    component_name=args.component))
+        print("== All rights for component '%s' ==" % args.component)
+        print_perms(perms, args.series)
 
-    if options.packageset:
-        for packageset in options.packageset:
+    if args.packageset:
+        for packageset in args.packageset:
             lp_set = launchpad.packagesets.getByName(
-                name=packageset, distroseries=options.series)
+                name=packageset, distroseries=args.series)
 
             perms = []
             for archive in archives:
@@ -179,27 +180,27 @@ def do_query(options):
                     packageset=lp_set))
             print(("== All uploaders for package set '%s' in '%s' "
                    "(owned by '%s') ==" %
-                  (packageset, options.series.name,
+                  (packageset, args.series.name,
                    lp_set.owner.display_name)))
-            print_perms(perms, options.series)
+            print_perms(perms, args.series)
 
             sources = sorted(lp_set.getSourcesIncluded(direct_inclusion=True))
             if sources:
                 print()
                 print("== All source packages in package set '%s' "
-                      "in '%s' ==" % (packageset, options.series.name))
+                      "in '%s' ==" % (packageset, args.series.name))
                 for source in sources:
                     print(source)
             child_sets = list(lp_set.setsIncluded(direct_inclusion=True))
             if child_sets:
                 print()
                 print("== All package sets in package set '%s' in '%s' ==" %
-                      (packageset, options.series.name))
+                      (packageset, args.series.name))
                 for child_set in child_sets:
                     print(child_set.name)
 
-    if options.source:
-        for source in options.source:
+    if args.source:
+        for source in args.source:
             perms = []
             perms_set = []
             for archive in archives:
@@ -208,63 +209,62 @@ def do_query(options):
                 perms_set.extend(archive.getPackagesetsForSource(
                     sourcepackagename=source))
             print("== All uploaders for package '%s' ==" % source)
-            print_perms(perms, options.series)
-            print_perms(perms_set, options.series)
+            print_perms(perms, args.series)
+            print_perms(perms_set, args.series)
             for archive in archives:
                 for series, component in get_source_components(
-                        options, launchpad, archive, source):
+                        args, launchpad, archive, source):
                     perms_component = archive.getUploadersForComponent(
                         component_name=component)
                     print_perms(perms_component, series=series)
 
-    if options.pocket:
+    if args.pocket:
         perms = []
-        if not options.acl_type or options.acl_type == 'upload':
+        if not args.acl_type or args.acl_type == 'upload':
             for archive in archives:
-                perms.extend(archive.getUploadersForPocket(
-                    pocket=options.pocket))
-        if not options.acl_type or options.acl_type == 'admin':
+                perms.extend(archive.getUploadersForPocket(pocket=args.pocket))
+        if not args.acl_type or args.acl_type == 'admin':
             for archive in archives:
                 perms.extend(archive.getQueueAdminsForPocket(
-                    pocket=options.pocket))
-        print("== All rights for pocket '%s' ==" % options.pocket)
-        print_perms(perms, options.series)
+                    pocket=args.pocket))
+        print("== All rights for pocket '%s' ==" % args.pocket)
+        print_perms(perms, args.series)
 
-    if (not options.person and not options.component and
-            not options.packageset and not options.source and
-            not options.pocket):
+    if (not args.person and not args.component and
+            not args.packageset and not args.source and
+            not args.pocket):
         perms = []
         for archive in archives:
             perms.extend(archive.getAllPermissions())
-        if options.acl_type:
-            perm_name = permission_names[options.acl_type]
+        if args.acl_type:
+            perm_name = permission_names[args.acl_type]
             perms = [p for p in perms if p.permission == perm_name]
         print("== All rights ==")
-        print_perms(perms, options.series)
+        print_perms(perms, args.series)
 
 
-def validate_add_delete_options(options, requires_person=True):
-    if options.packageset and options.source:
+def validate_add_delete_options(args, requires_person=True):
+    if args.packageset and args.source:
         # Special options to manage package sets, bodged into this tool
         # since they aren't entirely inconvenient here.
-        if options.component or options.person:
+        if args.component or args.person:
             print("-P <packageset> -s <source> cannot be used with a "
                   "component or person as well")
             return False
         return True
 
-    if requires_person and not options.person:
+    if requires_person and not args.person:
         print("You must specify at least one person to (de-)authorise.")
         return False
 
     count = 0
-    if options.component:
+    if args.component:
         count += 1
-    if options.packageset:
+    if args.packageset:
         count += 1
-    if options.source:
+    if args.source:
         count += 1
-    if options.pocket:
+    if args.pocket:
         count += 1
     if count > 1:
         print("You can only specify one of package set, source, component, "
@@ -279,94 +279,94 @@ def validate_add_delete_options(options, requires_person=True):
     return True
 
 
-def do_add(options):
+def do_add(args):
     """Add a new permission."""
-    if not validate_add_delete_options(options):
+    if not validate_add_delete_options(args):
         return False
 
-    if options.packageset and options.source:
-        for packageset in options.packageset:
+    if args.packageset and args.source:
+        for packageset in args.packageset:
             lp_set = launchpad.packagesets.getByName(
-                name=packageset, distroseries=options.series)
-            lp_set.addSources(names=options.source)
+                name=packageset, distroseries=args.series)
+            lp_set.addSources(names=args.source)
             print("Added:")
-            for source in options.source:
+            for source in args.source:
                 print(source)
         return
 
-    people = [launchpad.people[person] for person in options.person]
+    people = [launchpad.people[person] for person in args.person]
 
-    if options.source:
-        for source in options.source:
+    if args.source:
+        for source in args.source:
             for person in people:
-                perm = options.archive.newPackageUploader(
+                perm = args.archive.newPackageUploader(
                     person=person, source_package_name=source)
                 print("Added:")
                 print_perms([perm])
         return
 
-    if options.packageset:
-        for packageset in options.packageset:
+    if args.packageset:
+        for packageset in args.packageset:
             lp_set = launchpad.packagesets.getByName(
-                name=packageset, distroseries=options.series)
+                name=packageset, distroseries=args.series)
             for person in people:
-                perm = options.archive.newPackagesetUploader(
+                perm = args.archive.newPackagesetUploader(
                     person=person, packageset=lp_set)
                 print("Added:")
                 print_perms([perm])
         return
 
-    if options.component:
+    if args.component:
         for person in people:
-            if not options.acl_type or options.acl_type == 'upload':
-                perm = options.archive.newComponentUploader(
-                    person=person, component_name=options.component)
+            if not args.acl_type or args.acl_type == 'upload':
+                perm = args.archive.newComponentUploader(
+                    person=person, component_name=args.component)
             else:
-                perm = options.archive.newQueueAdmin(
-                    person=person, component_name=options.component)
+                perm = args.archive.newQueueAdmin(
+                    person=person, component_name=args.component)
             print("Added:")
             print_perms([perm])
         return
 
-    if options.pocket:
+    if args.pocket:
         admin_kwargs = {}
-        if options.series:
-            admin_kwargs["distroseries"] = options.series
+        if args.series:
+            admin_kwargs["distroseries"] = args.series
         for person in people:
-            if not options.acl_type or options.acl_type == 'upload':
-                perm = options.archive.newPocketUploader(
-                    person=person, pocket=options.pocket)
+            if not args.acl_type or args.acl_type == 'upload':
+                perm = args.archive.newPocketUploader(
+                    person=person, pocket=args.pocket)
             else:
-                perm = options.archive.newPocketQueueAdmin(
-                    person=person, pocket=options.pocket, **admin_kwargs)
+                perm = args.archive.newPocketQueueAdmin(
+                    person=person, pocket=args.pocket, **admin_kwargs)
             print("Added:")
             print_perms([perm])
         return
 
 
-def do_delete(options):
+def do_delete(args):
     """Delete a permission."""
     # We kind of hacked packageset management into here.
     # Deleting packagesets doesn't require a person...
-    requires_person = not (options.packageset and not options.source)
-    if not validate_add_delete_options(options, requires_person):
+    requires_person = not (args.packageset and not args.source)
+    if not validate_add_delete_options(args, requires_person):
         return False
 
-    if options.packageset and options.source:
-        for packageset in options.packageset:
+    if args.packageset and args.source:
+        for packageset in args.packageset:
             lp_set = launchpad.packagesets.getByName(
-                name=packageset, distroseries=options.series)
-            lp_set.removeSources(names=options.source)
+                name=packageset, distroseries=args.series)
+            lp_set.removeSources(names=args.source)
             print("Deleted:")
-            for source in options.source:
+            for source in args.source:
                 print(source)
         return
 
-    if options.packageset and not options.person:
-        for packageset in options.packageset:
+    if args.packageset and not args.person:
+        for packageset in args.packageset:
             lp_set = launchpad.packagesets.getByName(
-                name=packageset, distroseries=options.series)
-            uploaders = options.archive.getUploadersForPackageset(
+                name=packageset, distroseries=args.series)
+            uploaders = args.archive.getUploadersForPackageset(
                 direct_permissions=True, packageset=lp_set)
             if len(uploaders) > 0:
                 print("Cannot delete packageset with defined uploaders")
@@ -386,82 +386,82 @@ def do_delete(options):
             ack = input("Remove? (y/N): ")
             if ack.lower() == 'y':
                 lp_set.lp_delete()
-                print("Deleted %s/%s" % (lp_set.name, options.series.name))
+                print("Deleted %s/%s" % (lp_set.name, args.series.name))
         return
 
-    lp_people = [launchpad.people[person] for person in options.person]
+    lp_people = [launchpad.people[person] for person in args.person]
 
-    if options.source:
-        for source in options.source:
+    if args.source:
+        for source in args.source:
             for lp_person in lp_people:
                 try:
-                    options.archive.deletePackageUploader(
+                    args.archive.deletePackageUploader(
                         person=lp_person, source_package_name=source)
                     print("Deleted %s/%s" % (lp_person.name, source))
                 except Exception:
                     print("Failed to delete %s/%s" % (lp_person.name, source))
         return
 
-    if options.packageset:
-        for packageset in options.packageset:
+    if args.packageset:
+        for packageset in args.packageset:
             lp_set = launchpad.packagesets.getByName(
-                name=packageset, distroseries=options.series)
+                name=packageset, distroseries=args.series)
             for lp_person in lp_people:
-                options.archive.deletePackagesetUploader(
+                args.archive.deletePackagesetUploader(
                     person=lp_person, packageset=lp_set)
                 print("Deleted %s/%s/%s" % (lp_person.name, packageset,
-                                            options.series.name))
+                                            args.series.name))
         return
 
-    if options.component:
+    if args.component:
         for lp_person in lp_people:
-            if not options.acl_type or options.acl_type == 'upload':
-                options.archive.deleteComponentUploader(
-                    person=lp_person, component_name=options.component)
-                print("Deleted %s/%s" % (lp_person.name, options.component))
+            if not args.acl_type or args.acl_type == 'upload':
+                args.archive.deleteComponentUploader(
+                    person=lp_person, component_name=args.component)
+                print("Deleted %s/%s" % (lp_person.name, args.component))
             else:
-                options.archive.deleteQueueAdmin(
-                    person=lp_person, component_name=options.component)
+                args.archive.deleteQueueAdmin(
+                    person=lp_person, component_name=args.component)
                 print("Deleted %s/%s (admin)" % (lp_person.name,
-                                                 options.component))
+                                                 args.component))
         return
 
-    if options.pocket:
+    if args.pocket:
         admin_kwargs = {}
-        if options.series:
-            admin_kwargs["distroseries"] = options.series
+        if args.series:
+            admin_kwargs["distroseries"] = args.series
         for lp_person in lp_people:
-            if not options.acl_type or options.acl_type == 'upload':
-                options.archive.deletePocketUploader(
-                    person=lp_person, pocket=options.pocket)
-                print("Deleted %s/%s" % (lp_person.name, options.pocket))
+            if not args.acl_type or args.acl_type == 'upload':
+                args.archive.deletePocketUploader(
+                    person=lp_person, pocket=args.pocket)
+                print("Deleted %s/%s" % (lp_person.name, args.pocket))
             else:
-                options.archive.deletePocketQueueAdmin(
-                    person=lp_person, pocket=options.pocket, **admin_kwargs)
-                if options.series:
+                args.archive.deletePocketQueueAdmin(
+                    person=lp_person, pocket=args.pocket, **admin_kwargs)
+                if args.series:
                     print(
                         "Deleted %s/%s/%s (admin)" %
-                        (lp_person.name, options.pocket, options.series.name))
+                        (lp_person.name, args.pocket, args.series.name))
                 else:
                     print("Deleted %s/%s (admin)" %
-                          (lp_person.name, options.pocket))
+                          (lp_person.name, args.pocket))
         return
 
 
-def do_create(options):
-    if not options.packageset:
+def do_create(args):
+    if not args.packageset:
         print("You can only create a package set, not something else.")
         return False
 
-    if not options.person or len(options.person) != 1:
+    if not args.person or len(args.person) != 1:
         print("You must specify exactly one person to own the new package "
               "set.")
         return False
 
-    distro_series = options.series or options.distro.current_series
-    lp_person = launchpad.people[options.person[0]]
+    distro_series = args.series or args.distro.current_series
+    lp_person = launchpad.people[args.person[0]]
 
-    for packageset in options.packageset:
+    for packageset in args.packageset:
         try:
             if launchpad.packagesets.getByName(
                     name=packageset, distroseries=distro_series):
@@ -477,22 +477,22 @@ def do_create(options):
         print(ps)
 
 
-def do_modify(options):
-    if not options.packageset:
+def do_modify(args):
+    if not args.packageset:
         print("You can only modify a package set, not something else.")
         return False
 
-    if options.person and len(options.person) > 1:
+    if args.person and len(args.person) > 1:
         print("You can only specify one person as the new packageset owner.")
         return False
 
-    distro_series = options.series or options.distro.current_series
+    distro_series = args.series or args.distro.current_series
 
     lp_person = None
-    if options.person:
-        lp_person = launchpad.people[options.person[0]]
+    if args.person:
+        lp_person = launchpad.people[args.person[0]]
 
-    for packageset in options.packageset:
+    for packageset in args.packageset:
         lp_set = launchpad.packagesets.getByName(
             name=packageset, distroseries=distro_series)
         if lp_person:
@@ -521,22 +521,22 @@ def do_modify(options):
             continue
 
 
-def do_copy(options):
-    if options.archive.self_link == options.distro.main_archive_link:
-        archives = options.distro.archives
+def do_copy(args):
+    if args.archive.self_link == args.distro.main_archive_link:
+        archives = args.distro.archives
     else:
-        archives = [options.archive]
+        archives = [args.archive]
 
-    if not options.packageset:
+    if not args.packageset:
         print("You can only copy a package set, not something else.")
         return False
 
-    distro_series = options.series or options.distro.current_series
+    distro_series = args.series or args.distro.current_series
 
     dst = input("Name of the destination series: ")
-    dst_series = options.distro.getSeries(name_or_version=dst)
+    dst_series = args.distro.getSeries(name_or_version=dst)
 
-    for packageset in options.packageset:
+    for packageset in args.packageset:
         src_pkgset = launchpad.packagesets.getByName(
             name=packageset, distroseries=distro_series)
         if not src_pkgset:
@@ -560,27 +560,27 @@ def do_copy(options):
                 person=perm.person_link, packageset=ps)
 
 
-def do_check(options):
+def do_check(args):
     """Check if a person can upload a package."""
-    if not options.person:
+    if not args.person:
         print("A person needs to be specified to check.")
         return False
-    if not options.source:
+    if not args.source:
         print("A source package needs to be specified to check.")
         return False
 
-    people = [launchpad.people[person] for person in options.person]
-    distro_series = options.series or options.distro.current_series
+    people = [launchpad.people[person] for person in args.person]
+    distro_series = args.series or args.distro.current_series
 
-    if options.pocket:
-        pocket = options.pocket
+    if args.pocket:
+        pocket = args.pocket
     else:
         pocket = 'Release'
 
     for person in people:
-        for srcpkg in options.source:
+        for srcpkg in args.source:
             try:
-                spph = options.archive.getPublishedSources(
+                spph = args.archive.getPublishedSources(
                     distro_series=distro_series,
                     exact_match=True,
                     pocket=pocket,
@@ -588,10 +588,10 @@ def do_check(options):
                     status='Published',
                 )[0]
             except IndexError:
-                if not options.pocket:
+                if not args.pocket:
                     raise
-                # Not yet in options.pocket, but maybe in Release?
-                spph = options.archive.getPublishedSources(
+                # Not yet in args.pocket, but maybe in Release?
+                spph = args.archive.getPublishedSources(
                     distro_series=distro_series,
                     exact_match=True,
                     pocket='Release',
@@ -599,7 +599,7 @@ def do_check(options):
                     status='Published',
                 )[0]
             try:
-                options.archive.checkUpload(
+                args.archive.checkUpload(
                     component=spph.component_name,
                     distroseries=distro_series,
                     person=person,
@@ -619,99 +619,98 @@ def do_check(options):
                     print(e.content)
 
 
-def main(options, action):
+def main(args):
 
-    if action == "query":
-        do_query(options)
-    elif action == "add":
-        do_add(options)
-    elif action in ("delete", "remove"):
-        do_delete(options)
-    elif action == "create":
-        do_create(options)
-    elif action == "modify":
-        do_modify(options)
-    elif action == "copy":
-        do_copy(options)
-    elif action == "check":
-        do_check(options)
+    if args.action == "query":
+        do_query(args)
+    elif args.action == "add":
+        do_add(args)
+    elif args.action in ("delete", "remove"):
+        do_delete(args)
+    elif args.action == "create":
+        do_create(args)
+    elif args.action == "modify":
+        do_modify(args)
+    elif args.action == "copy":
+        do_copy(args)
+    elif args.action == "check":
+        do_check(args)
     else:
-        raise AssertionError("Invalid action %s" % action)
+        raise AssertionError("Invalid action %s" % args.action)
 
     return
 
 
 if __name__ == '__main__':
-    parser = OptionParser(
-        usage="usage: %prog [options] "
+    parser = argparse.ArgumentParser(
+        usage="%(prog)s [options] "
               "query|add|delete|create|modify|copy|check",
         epilog=lputils.ARCHIVE_REFERENCE_DESCRIPTION)
 
-    parser.add_option(
+    parser.add_argument(
         "-l", "--launchpad", dest="launchpad_instance", default="production")
-    parser.add_option("-A", "--archive", dest="archive")
-    parser.add_option("-S", "--series", dest="series")
-    parser.add_option("-p", "--person", dest="person", action="append")
-    parser.add_option("-c", "--component", dest="component")
-    parser.add_option("-P", "--packageset", dest="packageset", action="append")
-    parser.add_option("-s", "--source", dest="source", action="append")
-    parser.add_option("--pocket", dest="pocket")
-    parser.add_option("-t", "--acl-type", dest="acl_type",
-                      help="ACL type: upload or admin")
-    parser.add_option("--anon", dest="anon_login", action="store_true",
-                      default=False, help="Login anonymously to Launchpad")
+    parser.add_argument("-A", "--archive", dest="archive")
+    parser.add_argument("-S", "--series", dest="series")
+    parser.add_argument("-p", "--person", dest="person", action="append")
+    parser.add_argument("-c", "--component", dest="component")
+    parser.add_argument(
+        "-P", "--packageset", dest="packageset", action="append")
+    parser.add_argument("-s", "--source", dest="source", action="append")
+    parser.add_argument("--pocket", dest="pocket")
+    parser.add_argument(
+        "-t", "--acl-type", dest="acl_type", help="ACL type: upload or admin")
+    parser.add_argument(
+        "--anon", dest="anon_login", action="store_true", default=False,
+        help="Login anonymously to Launchpad")
+    parser.add_argument(
+        "action",
+        choices=(
+            "query", "add", "delete", "create", "modify", "copy", "check"),
+        help="action to perform")
 
     # Deprecated in favour of -A.
-    parser.add_option(
+    parser.add_argument(
         "-d", "--distribution", dest="distro", default="ubuntu",
-        help=SUPPRESS_HELP)
+        help=argparse.SUPPRESS)
 
-    options, args = parser.parse_args()
+    args = parser.parse_args()
 
-    possible_actions = ('query', 'add', 'delete', 'create', 'copy', 'check')
-
-    if len(args) != 1:
-        parser.error(
-            "You must specify an action, one of:\n%s" %
-            ", ".join(possible_actions))
-
-    if options.anon_login and args[0] not in ('query', 'check'):
+    if args.anon_login and args.action not in ('query', 'check'):
         print("E: Anonymous login not supported for this action.")
         sys.exit(1)
 
-    if (args[0] != 'query' and
-            not options.person and not options.component and
-            not options.packageset and not options.source and
-            not options.pocket):
+    if (args.action != 'query' and
+            not args.person and not args.component and
+            not args.packageset and not args.source and
+            not args.pocket):
         parser.error("Provide at least one of "
                      "person/component/packageset/source/pocket")
-    if options.packageset and not options.series:
+    if args.packageset and not args.series:
         parser.error("Package set requires an associated series")
-    if options.acl_type and options.acl_type not in ('upload', 'admin'):
+    if args.acl_type and args.acl_type not in ('upload', 'admin'):
         parser.error("Invalid ACL type '%s' (valid: 'upload', 'admin')" %
-                     options.acl_type)
-    if options.acl_type == 'admin' and options.packageset:
+                     args.acl_type)
+    if args.acl_type == 'admin' and args.packageset:
         parser.error("ACL type admin not allowed for package sets")
-    if options.acl_type == 'admin' and options.source:
+    if args.acl_type == 'admin' and args.source:
         parser.error("ACL type admin not allowed for source packages")
-    if options.pocket:
-        options.pocket = options.pocket.title()
+    if args.pocket:
+        args.pocket = args.pocket.title()
 
-    if options.anon_login:
+    if args.anon_login:
         launchpad = Launchpad.login_anonymously(
-            CONSUMER_KEY, options.launchpad_instance, version="devel")
+            CONSUMER_KEY, args.launchpad_instance, version="devel")
     else:
         launchpad = Launchpad.login_with(
-            CONSUMER_KEY, options.launchpad_instance, version="devel")
+            CONSUMER_KEY, args.launchpad_instance, version="devel")
 
-    options.archive = get_archive(options, launchpad)
-    options.distro = options.archive.distribution
-    if options.series is not None:
-        options.series = options.distro.getSeries(
-            name_or_version=options.series)
+    args.archive = get_archive(args, launchpad)
+    args.distro = args.archive.distribution
+    if args.series is not None:
+        args.series = args.distro.getSeries(name_or_version=args.series)
 
     try:
-        main(options, args[0])
+        main(args)
     except launchpadlib.errors.HTTPError as err:
         print("There was a %s error:" % err.response.status)
         print(err.content)

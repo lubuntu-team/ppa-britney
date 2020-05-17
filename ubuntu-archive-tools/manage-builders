@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # Manage the Launchpad build farm.
 #
 # Copyright 2012-2014 Canonical Ltd.
@@ -83,6 +83,9 @@ parser.add_argument(
 parser.add_argument(
     "-d", "--disabled", action="store_const", dest="ok_filter", const=False,
     help="update only disabled builders")
+parser.add_argument(
+    "--idle", action="store_const", dest="idle_filter", const=True,
+    help="update only idle builders")
 parser.add_argument(
     "--cleaning", action="store_const", dest="cleaning_filter", const=True,
     help="update only builders that are stuck cleaning")
@@ -173,6 +176,12 @@ def get_processor_name(processor_link):
 def get_clean_status_duration(builder):
     return datetime.now(pytz.UTC) - builder.date_clean_status_changed
 
+def is_idle(builder):
+    return (
+        builder.builderok
+        and builder.current_build_link is None
+        and builder.clean_status == 'Clean')
+
 def is_cleaning(builder):
     return (
         builder.builderok
@@ -185,6 +194,8 @@ for builder in lp.builders:
     if not builder.active:
         continue
     if args.ok_filter is not None and builder.builderok != args.ok_filter:
+        continue
+    if args.idle_filter is not None and is_idle(builder) != args.idle_filter:
         continue
     if (args.cleaning_filter is not None
             and is_cleaning(builder) != args.cleaning_filter):

@@ -74,6 +74,13 @@ def process_bug(launchpad, sourcepkg, version, release, num):
               'Is there anything left to sponsor?' % num)
 
     if not sourcepkg or 'linux' not in sourcepkg:
+        block_proposed_series = 'block-proposed-%s' % release
+        if block_proposed_series in bug.tags:
+            print('The %s tag is still set on bug LP: #%s. '
+                  'Should the package continue to be blocked in proposed? '
+                  'Please investigate and adjust the tags accordingly.'
+                  % (block_proposed_series, num))
+
         # this dance is needed due to
         # https://bugs.launchpad.net/launchpadlib/+bug/254901
         btags = bug.tags
@@ -124,7 +131,8 @@ def process_bug(launchpad, sourcepkg, version, release, num):
     text += ('  Your feedback will aid us getting this update out to other '
              'Ubuntu users.\n\nIf this package fixes the bug for you, '
              'please add a comment to this bug, mentioning the version of the '
-             'package you tested and change the tag from '
+             'package you tested, what testing has been performed on the '
+             'package and change the tag from '
              'verification-needed-%s to verification-done-%s. '
              'If it does not fix the bug for you, please add a comment '
              'stating that, and change the tag to verification-failed-%s. '

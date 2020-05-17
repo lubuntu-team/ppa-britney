@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python2.7
 
 # Synchronise package priorities with germinate output
 # Copyright (C) 2005, 2009, 2010, 2011, 2012  Canonical Ltd.

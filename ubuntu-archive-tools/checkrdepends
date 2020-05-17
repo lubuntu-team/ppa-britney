@@ -1,4 +1,4 @@
-#! /usr/bin/python
+#! /usr/bin/python2.7
 
 # Copyright (C) 2009, 2010, 2011, 2012  Canonical Ltd.
 
@@ -17,18 +17,16 @@
 from __future__ import print_function
 
 from collections import defaultdict
-import gzip
 import optparse
 import os
 import re
 import sys
-import tempfile
 
-import apt_pkg
+from utils import read_tag_file
 
 
 default_base = '/home/ubuntu-archive/mirror/ubuntu'
-default_suite = 'disco'
+default_suite = 'groovy'
 components = ('main', 'restricted', 'universe', 'multiverse')
 
 # Cut-down RE from deb822.PkgRelation.
@@ -63,34 +61,6 @@ def ports_arches(suite):
         return ('arm64', 'armhf', 'powerpc', 'ppc64el', 's390x')
     else:
         return ('arm64', 'armhf', 'ppc64el', 's390x')
-
-
-def read_tag_file(path):
-    tmp = tempfile.NamedTemporaryFile(prefix='checkrdepends.', delete=False)
-    try:
-        compressed = gzip.open(path)
-        try:
-            tmp.write(compressed.read())
-        finally:
-            compressed.close()
-        tmp.close()
-        with open(tmp.name) as uncompressed:
-            tag_file = apt_pkg.TagFile(uncompressed)
-            prev_name = None
-            prev_stanza = None
-            for stanza in tag_file:
-                try:
-                    name = stanza['package']
-                except KeyError:
-                    continue
-                if name != prev_name and prev_stanza is not None:
-                    yield prev_stanza
-                prev_name = name
-                prev_stanza = stanza
-            if prev_stanza is not None:
-                yield prev_stanza
-    finally:
-        os.unlink(tmp.name)
 
 
 def read_sources(path):

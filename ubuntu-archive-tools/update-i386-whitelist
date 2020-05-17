@@ -1,0 +1,139 @@
+#!/usr/bin/python3
+
+# Copyright (C) 2020  Canonical Ltd.
+# Author: Steve Langasek <steve.langasek@canonical.com>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+'''Synchronize the i386 source package whitelist in Launchpad with the output
+of germinate.
+
+USAGE:
+    update-i386-whitelist [--dry-run] https://people.canonical.com/~ubuntu-archive/germinate-output/i386.focal/i386+build-depends.sources
+'''
+
+from launchpadlib.launchpad import Launchpad
+import optparse
+from urllib.request import urlopen
+import sys
+
+def get_sources_from_url(url):
+    '''Download the germinate output and parse out the list of sources.
+
+    Returns list of source package names.
+    '''
+    sources = []
+
+    file = urlopen(url)
+    for i in file:
+        if i.startswith(b'Source') or i.startswith(b'---'):
+            continue
+        sources.append(i.decode('utf-8').split(' ',maxsplit=1)[0])
+    return sources
+
+def parse_options():
+    '''Parse command line arguments.
+
+    Return (options, source_package) tuple.
+    '''
+    parser = optparse.OptionParser(
+        usage='Usage: %prog [--dry-run] https://people.canonical.com/~ubuntu-archive/germinate-output/i386.focal/i386+build-depends.sources')
+    parser.add_option(
+        "--dry-run", help="don't change launchpad, just report the delta",
+        action="store_true")
+    parser.add_option(
+        "-s", dest="release", default=default_release, metavar="RELEASE",
+        help="release (default: %s)" % default_release)
+
+    (opts, args) = parser.parse_args()
+
+    if len(args) != 1:
+        parser.error('Need to specify a URL to sync from')
+
+    return (opts, args[0])
+
+
+if __name__ == '__main__':
+
+    default_release = 'focal'
+
+    (opts, url) = parse_options()
+
+    launchpad = Launchpad.login_with('update-i386-whitelist',
+                                     'production',
+                                     version="devel")
+    ubuntu = launchpad.distributions['ubuntu']
+    series = ubuntu.getSeries(name_or_version=opts.release)
+    archive = ubuntu.main_archive
+
+    sources = get_sources_from_url(url)
+
+    packageset = launchpad.packagesets.getByName(name='i386-whitelist',
+                                                 distroseries=series)
+    currentSet = set(packageset.getSourcesIncluded())
+    newSet = set(sources)
+    # hard-coded list of ppa-only additions; can maybe go away when
+    # https://bugs.launchpad.net/launchpad/+bug/1855069 is fixed, but this is
+    # also potentially useful for bootstrapping any additional packages into
+    # the archive if needed.
+
+    # bootstrap new spdlog dep
+    newSet.update(['fmtlib'])
+    # for new lintian
+    newSet.update(['libdevel-size-perl', 'libcpanel-json-xs-perl',
+                   'libsereal-decoder-perl', 'libsereal-encoder-perl',
+                   'libjson-xs-perl'])
+
+    # needed to bootstrap openjdk-N
+    newSet.update(['openjdk-12'])
+    newSet.update(['openjdk-13'])
+    newSet.update(['openjdk-14'])
+    newSet.update(['openjdk-15'])
+    newSet.update(['openjdk-8'])
+
+    # we get the wrong answer from germinate about a source package's
+    # whitelisting when the package provides both Arch: any and Arch: all
+    # binaries but we actually only want the Arch: all ones.  Rather than
+    # fix this in germinate, for now just manually exclude the packages
+    # we've found that have this problem.
+    for pkg in ('frei0r', 'xorg', 'ubuntu-drivers-common'):
+        try:
+            newSet.remove(pkg)
+        except KeyError:
+            pass
+    print("Additions:" )
+    additions = list(newSet-currentSet)
+    additions.sort()
+    for i in additions:
+        print(" * %s" % i)
+    print("Removals:" )
+    removals = list(currentSet-newSet)
+    removals.sort()
+    for i in removals:
+        print(" * %s" % i)
+    if opts.dry_run:
+        print("--dry-run is set, doing nothing.")
+        sys.exit(0)
+
+    if additions or removals:
+        print("Commit changes to the packageset? [yN] ", end="")
+        sys.stdout.flush()
+        response = sys.stdin.readline()
+        if not response.strip().lower().startswith('y'):
+            sys.exit(1)
+
+    if additions:
+        packageset.addSources(names=additions)
+    if removals:
+        packageset.removeSources(names=removals)
+

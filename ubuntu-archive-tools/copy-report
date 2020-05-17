@@ -1,10 +1,10 @@
-#! /usr/bin/env python
+#! /usr/bin/env python2.7
 
 from __future__ import print_function
 
 import atexit
+import bz2
 from collections import namedtuple
-import gzip
 import optparse
 import os
 import re
@@ -13,12 +13,13 @@ import subprocess
 import tempfile
 try:
     from urllib.parse import unquote
-    from urllib.request import urlretrieve
 except ImportError:
-    from urllib import unquote, urlretrieve
+    from urllib import unquote
 
 import apt_pkg
 from launchpadlib.launchpad import Launchpad
+import lzma
+import requests
 
 
 # from dak, more or less
@@ -44,18 +45,42 @@ def ensure_tempdir():
 
 def decompress_open(tagfile):
     if tagfile.startswith('http:') or tagfile.startswith('ftp:'):
-        url = tagfile
-        tagfile = urlretrieve(url)[0]
-
-    if tagfile.endswith('.gz'):
         ensure_tempdir()
-        decompressed = tempfile.mktemp(dir=tempdir)
-        fin = gzip.GzipFile(filename=tagfile)
-        with open(decompressed, 'wb') as fout:
-            fout.write(fin.read())
-        return open(decompressed, 'r')
+        response = requests.get(tagfile, stream=True)
+        if response.status_code == 404:
+            response.close()
+            tagfile = tagfile.replace('.xz', '.bz2')
+            response = requests.get(tagfile, stream=True)
+        response.raise_for_status()
+        if '.' in tagfile:
+            suffix = '.' + tagfile.rsplit('.', 1)[1]
+        else:
+            suffix = ''
+        fd, tagfile = tempfile.mkstemp(suffix=suffix, dir=tempdir)
+        with os.fdopen(fd, 'wb') as f:
+            f.write(response.raw.read())
+        response.close()
+    elif not os.path.exists(tagfile):
+        tagfile = tagfile.replace('.xz', '.bz2')
+
+    if tagfile.endswith('.xz'):
+        decompressor = lzma.LZMAFile
+    elif tagfile.endswith('.bz2'):
+        decompressor = bz2.BZ2File
     else:
-        return open(tagfile, 'r')
+        decompressor = None
+
+    if decompressor is not None:
+        fd, decompressed = tempfile.mkstemp(dir=tempdir)
+        dcf = decompressor(tagfile)
+        try:
+            with os.fdopen(fd, 'wb') as f:
+                f.write(dcf.read())
+        finally:
+            dcf.close()
+        return open(decompressed, 'rb')
+    else:
+        return open(tagfile, 'rb')
 
 
 Section = namedtuple("Section", ["version", "directory", "files"])
@@ -84,7 +109,11 @@ def find_dsc(options, pkg, section):
     filenames = []
     for url in spph.sourceFileUrls():
         filename = os.path.join(outdir, unquote(os.path.basename(url)))
-        urlretrieve(url, filename)
+        response = requests.get(url, stream=True)
+        response.raise_for_status()
+        with open(filename, 'wb') as f:
+            f.write(response.raw.read())
+        response.close()
         filenames.append(filename)
     yield [s for s in filenames if s.endswith('.dsc')][0]
 
@@ -132,7 +161,8 @@ def descended_from(options, pkg, section1, section2):
     for dsc in find_dsc(options, pkg, section1):
         try:
             versions = get_changelog_versions(pkg, dsc, section1.version)
-        except BrokenSourcePackage as exception:
+        except BrokenSourcePackage as e:
+            exception = e
             continue
         return section1.version in versions
     raise exception
@@ -223,9 +253,9 @@ def main():
 
     for suite in suites:
         for component in 'main', 'restricted', 'universe', 'multiverse':
-            tagfile1 = '%s/dists/%s-security/%s/source/Sources.gz' % (
+            tagfile1 = '%s/dists/%s-security/%s/source/Sources.xz' % (
                 options.mirrors[0], suite, component)
-            tagfile2 = '%s/dists/%s-updates/%s/source/Sources.gz' % (
+            tagfile2 = '%s/dists/%s-updates/%s/source/Sources.xz' % (
                 options.mirrors[0], suite, component)
             name1 = '%s-security' % suite
             name2 = '%s-updates' % suite
